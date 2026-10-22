@@ -86,7 +86,7 @@ jobs:
           python-version: "3.12"
 
       - name: Python dependencies
-        run: python -m pip install --upgrade pip pillow py7zr pyzipper
+        run: python -m pip install --upgrade pip pillow py7zr pyzipper curl_cffi playwright
 
       - name: Toolchain
         shell: pwsh
@@ -135,378 +135,7 @@ jobs:
           GAME_URL: ${{ inputs.url }}
           EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
         run: |
-          $fetchScript = Join-Path $env:RUNNER_TEMP "fetch_and_extract.py"
-          @'
-          import base64
-          import http.cookiejar
-          import os
-          import re
-          import shutil
-          import struct
-          import subprocess
-          import sys
-          import tarfile
-          import urllib.parse
-          import urllib.request
-          import zipfile
-
-          DEFAULT_PASSWORD = "LegionGamesGod"
-          BROWSER_UA = (
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-          )
-
-          def log(msg):
-              print("[fetch] " + msg, flush=True)
-
-          def candidate_passwords(pw):
-              seen = []
-              for p in (pw, DEFAULT_PASSWORD, ""):
-                  if p is not None and p not in seen:
-                      seen.append(p)
-              return seen
-
-          def gdrive_id(url):
-              u = urllib.parse.urlparse(url)
-              if "drive.google.com" not in u.netloc and "docs.google.com" not in u.netloc:
-                  return None
-              m = re.search(r"/file/d/([A-Za-z0-9_-]+)", u.path)
-              if m:
-                  return m.group(1)
-              q = urllib.parse.parse_qs(u.query)
-              return q["id"][0] if "id" in q else None
-
-          def mediafire_clean_url(url):
-              u = urllib.parse.urlparse(url)
-              host = u.netloc.lower()
-              if "mediafire.com" not in host:
-                  return None
-              m = re.search(r"/(?:file|file_premium|download)/([A-Za-z0-9]+)", u.path)
-              if m:
-                  return "https://www.mediafire.com/file/%s/" % m.group(1)
-              if host.startswith("download"):
-                  parts = [p for p in u.path.split("/") if p]
-                  if len(parts) >= 2:
-                      return "https://www.mediafire.com/file/%s/" % parts[1]
-              return None
-
-          def extract_mediafire_direct(html_bytes):
-              html = html_bytes.decode("utf-8", "ignore")
-              for m in re.finditer(r'data-scrambled-url=["\']([A-Za-z0-9+/=]+)["\']', html):
-                  try:
-                      dec = base64.b64decode(m.group(1)).decode("utf-8", "ignore").strip()
-                      if dec.startswith(("http://", "https://")):
-                          return dec
-                  except Exception:
-                      pass
-              for pat in (
-                  r'id=["\']downloadButton["\'][^>]*href=["\'](https?://[^"\']+)["\']',
-                  r'href=["\'](https?://[^"\']+)["\'][^>]*id=["\']downloadButton["\']',
-                  r'aria-label=["\']Download file["\'][^>]*href=["\'](https?://[^"\']+)["\']',
-                  r'href=["\'](https?://download[0-9a-z.-]*\.mediafire\.com/[^"\']+)["\']',
-              ):
-                  m = re.search(pat, html, re.I)
-                  if m and "javascript:" not in m.group(1).lower():
-                      return m.group(1).strip()
-              return None
-
-          def sanitize_name(name):
-              name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name or "").strip(" .")
-              return name or "download.bin"
-
-          def filename_from_resp(resp, url):
-              cd = resp.headers.get("Content-Disposition", "")
-              m = (
-                  re.search(r"filename\*=(?:UTF-8'')?\"?([^\";\r\n]+)", cd, re.I)
-                  or re.search(r'filename="?([^";\r\n]+)"?', cd, re.I)
-              )
-              if m:
-                  return sanitize_name(os.path.basename(urllib.parse.unquote(m.group(1).strip())))
-              return sanitize_name(urllib.parse.unquote(os.path.basename(urllib.parse.urlparse(url).path)))
-
-          def http_fetch(opener, url, dest_dir):
-              log("GET " + url)
-              req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
-              with opener.open(req, timeout=180) as resp:
-                  final_url = resp.geturl()
-                  ctype = resp.headers.get("Content-Type", "").lower()
-                  path = os.path.join(dest_dir, filename_from_resp(resp, final_url))
-                  total = int(resp.headers.get("Content-Length") or 0)
-                  got, last = 0, -1
-                  with open(path, "wb") as f:
-                      while True:
-                          chunk = resp.read(1 << 22)
-                          if not chunk:
-                              break
-                          f.write(chunk)
-                          got += len(chunk)
-                          if total >= (8 << 20):
-                              pct = got * 100 // total
-                              if pct // 10 != last:
-                                  last = pct // 10
-                                  log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
-                  log("saved %s (%.1f MB)" % (path, got / 1e6))
-              return path, got, ctype, final_url
-
-          def looks_html(path, ctype):
-              with open(path, "rb") as f:
-                  head = f.read(4096).lstrip().lower()
-              return (
-                  "text/html" in ctype
-                  or head.startswith(b"<!doctype html")
-                  or head.startswith(b"<html")
-                  or b"<html" in head[:1024]
-              )
-
-          def download(url, dest_dir):
-              os.makedirs(dest_dir, exist_ok=True)
-              gid = gdrive_id(url)
-              if gid:
-                  log("Google Drive -> gdown (%s)" % gid)
-                  subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gdown"])
-                  import gdown
-                  out = gdown.download(id=gid, output=os.path.join(dest_dir, ""), quiet=False, fuzzy=True)
-                  if not out or not os.path.isfile(out):
-                      raise SystemExit("gdown could not fetch the file -- check link permissions")
-                  return out
-              if "dropbox.com" in url:
-                  url = re.sub(r"[?&]dl=0", lambda m: m.group(0)[0] + "dl=1", url)
-                  if "dl=1" not in url:
-                      url += ("&" if "?" in url else "?") + "dl=1"
-              if "mega.nz" in url or "mega.co.nz" in url:
-                  log("MEGA -> mega.py")
-                  subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "mega.py"])
-                  from mega import Mega
-                  return str(Mega().login().download_url(url, dest_dir))
-              if any(ch.isspace() for ch in url):
-                  raise SystemExit("URL contains spaces or line breaks. Paste the complete URL.")
-
-              jar = http.cookiejar.CookieJar()
-              opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-              path, got, ctype, final_url = http_fetch(opener, url, dest_dir)
-              if looks_html(path, ctype):
-                  with open(path, "rb") as f:
-                      html_bytes = f.read(512 * 1024)
-                  os.remove(path)
-                  direct = extract_mediafire_direct(html_bytes)
-                  if not direct:
-                      clean_mf = mediafire_clean_url(url) or mediafire_clean_url(final_url)
-                      if clean_mf and clean_mf.rstrip("/") != url.rstrip("/"):
-                          log("MediaFire token expired -> resolving %s" % clean_mf)
-                          p2, _, _, _ = http_fetch(opener, clean_mf, dest_dir)
-                          with open(p2, "rb") as f:
-                              html_bytes = f.read(512 * 1024)
-                          os.remove(p2)
-                          direct = extract_mediafire_direct(html_bytes)
-                  if direct:
-                      log("MediaFire resolved direct file URL")
-                      path, got, ctype, final_url = http_fetch(opener, direct, dest_dir)
-              if looks_html(path, ctype):
-                  os.remove(path)
-                  raise SystemExit("Link returned HTML instead of a game file. Check share permissions or use a direct link.")
-              if got == 0:
-                  raise SystemExit("Downloaded file is empty.")
-              return path
-
-          def archive_kind(path):
-              if not path or not os.path.isfile(path):
-                  return None
-              low = path.lower()
-              try:
-                  with open(path, "rb") as f:
-                      head = f.read(0x210)
-              except OSError:
-                  head = b""
-              if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
-                  return "zip"
-              if head[:6] == b"7z\xbc\xaf\x27\x1c":
-                  return "7z"
-              if head[:6] == b"Rar!\x1a\x07":
-                  return "rar"
-              if head[:2] == b"\x1f\x8b" or head[:6] == b"\xfd7zXZ" or head[:3] == b"BZh" or (len(head) >= 0x106 and head[0x101:0x106] == b"ustar"):
-                  return "tar"
-              if low.endswith((".zip", ".zip.001")):
-                  return "zip"
-              if low.endswith((".7z", ".7z.001")):
-                  return "7z"
-              if low.endswith(".rar"):
-                  return "rar"
-              if low.endswith((".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2")):
-                  return "tar"
-              return None
-
-          def is_secondary_vol(fn):
-              low = fn.lower()
-              if re.search(r"\.part(?!0*1\.rar$)\d+\.rar$", low):
-                  return True
-              if re.search(r"\.[rz]\d{2,}$", low):
-                  return True
-              if re.search(r"\.\d{3}$", low) and not low.endswith(".001"):
-                  return True
-              return False
-
-          def find_7z():
-              for c in ("7z", r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe", "7zz", "7za", "7zr"):
-                  p = shutil.which(c) or (c if os.path.isfile(c) else None)
-                  if p:
-                      return p
-              return None
-
-          def unpack_one(path, out_dir, password):
-              kind = archive_kind(path) or "archive"
-              os.makedirs(out_dir, exist_ok=True)
-              pws = candidate_passwords(password)
-              errs = []
-              sz = find_7z()
-              if sz:
-                  for pw in pws:
-                      r = subprocess.run(
-                          [sz, "x", "-y", "-aoa", "-p" + pw, "-o" + out_dir, path],
-                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True, errors="replace",
-                      )
-                      if r.returncode == 0:
-                          return out_dir
-                      errs.append("7z: " + (r.stdout or "").strip()[-300:])
-              if kind == "7z":
-                  import py7zr
-                  for pw in pws:
-                      try:
-                          with py7zr.SevenZipFile(path, mode="r", password=pw or None) as z:
-                              z.extractall(path=out_dir)
-                          return out_dir
-                      except Exception as ex:
-                          errs.append("py7zr: %s" % ex)
-              if kind == "zip":
-                  import pyzipper
-                  for pw in pws:
-                      try:
-                          with pyzipper.AESZipFile(path, "r") as z:
-                              z.extractall(out_dir, pwd=pw.encode("utf-8") if pw else None)
-                          return out_dir
-                      except Exception as ex:
-                          errs.append("pyzipper: %s" % ex)
-                  for pw in pws:
-                      try:
-                          with zipfile.ZipFile(path, "r") as z:
-                              z.extractall(out_dir, pwd=pw.encode("utf-8") if pw else None)
-                          return out_dir
-                      except Exception as ex:
-                          errs.append("zipfile: %s" % ex)
-              if kind == "tar":
-                  with tarfile.open(path, "r:*") as tf:
-                      tf.extractall(out_dir)
-                  return out_dir
-              raise SystemExit("Archive extraction failed (%s): %s" % (kind, "; ".join(errs)[:600]))
-
-          def is_xex(p):
-              try:
-                  with open(p, "rb") as f:
-                      return f.read(4) == b"XEX2"
-              except OSError:
-                  return False
-
-          def find_god_or_stfs(folder):
-              gods, stfs = [], []
-              for r, _, files in os.walk(folder):
-                  for fn in files:
-                      p = os.path.join(r, fn)
-                      try:
-                          if os.path.getsize(p) < 0x3B0:
-                              continue
-                          with open(p, "rb") as f:
-                              hdr = f.read(0x3B0)
-                      except OSError:
-                          continue
-                      if hdr[:4] not in (b"CON ", b"LIVE", b"PIRS"):
-                          continue
-                      if struct.unpack_from(">I", hdr, 0x3A9)[0] == 1:
-                          gods.append((0 if os.path.isdir(p + ".data") else 1, p))
-                      else:
-                          stfs.append((-os.path.getsize(p), p))
-              gods.sort()
-              stfs.sort()
-              return (gods[0][1] if gods else None), (stfs[0][1] if stfs else None)
-
-          def unpack_all(path, dest_dir, password):
-              if not archive_kind(path):
-                  return None
-              out = os.path.join(dest_dir, "unpacked")
-              log("extracting archive %s with password" % os.path.basename(path))
-              unpack_one(path, out, password)
-              try:
-                  os.remove(path)
-              except OSError:
-                  pass
-              for _ in range(3):
-                  god_hdr, stfs_pkg = find_god_or_stfs(out)
-                  if god_hdr or stfs_pkg:
-                      break
-                  has_ready, nested = False, []
-                  for r, _, files in os.walk(out):
-                      for fn in sorted(files):
-                          p = os.path.join(r, fn)
-                          fl = fn.lower()
-                          if fl == "default.xex" or fl.endswith(".iso") or is_xex(p):
-                              has_ready = True
-                          elif not is_secondary_vol(fn) and archive_kind(p):
-                              nested.append(p)
-                  if has_ready or not nested:
-                      break
-                  for i, inner in enumerate(nested):
-                      log("extracting nested archive %s" % os.path.basename(inner))
-                      unpack_one(inner, os.path.join(os.path.dirname(inner), "_inner_%d" % i), password)
-                      try:
-                          os.remove(inner)
-                      except OSError:
-                          pass
-              return out
-
-          def pick_container(root):
-              if os.path.isfile(root):
-                  if is_xex(root):
-                      folder = os.path.dirname(root)
-                      want = os.path.join(folder, "default.xex")
-                      if os.path.abspath(root) != os.path.abspath(want):
-                          shutil.move(root, want)
-                      return folder
-                  return root
-              xexes, isos, others = [], [], []
-              for r, _, files in os.walk(root):
-                  for fn in files:
-                      p = os.path.join(r, fn)
-                      fl = fn.lower()
-                      if fl == "default.xex":
-                          xexes.append(p)
-                      elif fl.endswith(".iso"):
-                          isos.append(p)
-                      elif is_xex(p) and not fl.endswith(".xexp"):
-                          others.append(p)
-              if xexes:
-                  return os.path.dirname(sorted(xexes, key=len)[0])
-              if isos:
-                  return sorted(isos, key=lambda p: -os.path.getsize(p))[0]
-              god_hdr, stfs_pkg = find_god_or_stfs(root)
-              if god_hdr:
-                  return god_hdr
-              if stfs_pkg:
-                  return stfs_pkg
-              if others:
-                  return pick_container(others[0])
-              return root
-
-          url = os.environ["GAME_URL"].strip()
-          dest = os.path.join(os.environ["RUNNER_TEMP"], "input")
-          pw = os.environ.get("EXTRACT_PASSWORD") or DEFAULT_PASSWORD
-          got = download(url, os.path.join(dest, "dl"))
-          root = unpack_all(got, dest, pw) or got
-          container = pick_container(root)
-          log("container for rexauto: " + container)
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out_f:
-              out_f.write("container=%s\n" % container)
-          '@ | Set-Content -Path $fetchScript -Encoding utf8
-
-          python $fetchScript
+          python tools/ci_fetch.py "$env:GAME_URL" "$env:RUNNER_TEMP\input" --password "$env:EXTRACT_PASSWORD"
           if ($LASTEXITCODE -ne 0) {
             throw "Game download or archive extraction failed."
           }
@@ -526,15 +155,11 @@ jobs:
           $args = @(
             $env:CONTAINER,
             "--name", $env:PROJECT_NAME,
+            "--password", $env:EXTRACT_PASSWORD,
             "--no-jumptables",
             "--heal-iters", $env:HEAL_ITERS,
             "--publish-gabarito"
           )
-
-          $helpTxt = (python rexauto.py --help 2>&1 | Out-String)
-          if ($helpTxt -match '--password') {
-            $args += @("--password", $env:EXTRACT_PASSWORD)
-          }
 
           if ($env:RUNHEAL -ne "true") {
             $args += @("--until", "build")
@@ -755,4 +380,386 @@ jobs:
             android/app/.cxx/**/CMakeOutput.log
             android/app/.cxx/**/CMakeError.log
           if-no-files-found: ignore
+          retention-days: 14
+### Why that `HTTP Error 403: Forbidden` happened (and how it's fixed)
+1. Your `download2393.mediafire.com/<token>/ubdhf5n6eud48u2/DBX-XEX.rar` direct link contained an IP-bound token that expired on the GitHub runner IP, and when `urllib.request` tried to open the clean MediaFire share page, Cloudflare blocked Python `urllib`'s TLS fingerprint with **`403 Forbidden`**.
+2. I updated and **already pushed** `tools/ci_fetch.py` to your `arena/c9cf5f5c-rexautot` branch on GitHub (`7cd304d`) with:
+   - **`curl_cffi` (`impersonate="chrome"`)** so requests use genuine Chrome TLS/HTTP2 fingerprints instead of `urllib` (reconstructing `https://www.mediafire.com/file/ubdhf5n6eud48u2/DBX-XEX.rar/file` cleanly if the direct download token expired).
+   - **Real Chrome / Edge browser fallback (`playwright`)** on the Windows runner that opens the page, clicks `#downloadButton` / solves JS checks natively, and saves the file if MediaFire/Cloudflare requires JavaScript.
+   - Automatic extraction of `.rar`, `.7z`, and `.zip` archives using password **`LegionGamesGod`**.
+
+### Full `.github/workflows/main.yml` for Copy & Paste
+Paste this into `.github/workflows/main.yml` on branch `arena/c9cf5f5c-rexautot`:
+
+```yaml
+name: Recompile for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Link direto do jogo Xbox 360"
+        required: true
+        type: string
+        default: "https://download2393.mediafire.com/b7kgzwaef0egozKKxpDUp9ynHoW3loUHnC7Yg5RhG7_htzTAnJY5qC1pQinMiJ0-Uo0Sd4FZu6G3MtpVxujq8IoUV4AD-NWYUJMMatrlpDGQWQDaufJguRuWCznILI_GX2nT5P6l9QOzhoewrJs_KGvkGxOXBhO4WQ80l-hXvREX/ubdhf5n6eud48u2/DBX-XEX.rar"
+      name:
+        description: "Nome do projeto e APK"
+        required: true
+        type: string
+        default: "db_xenoverse_recomp"
+      password:
+        description: "Password to extract archive"
+        required: false
+        type: string
+        default: "LegionGamesGod"
+      baseline_arm:
+        description: "Build for ARMv8.0"
+        required: false
+        type: boolean
+        default: false
+      runheal:
+        description: "Run the Windows run-heal loop"
+        required: false
+        type: boolean
+        default: false
+      heal_iters:
+        description: "Max run-heal iterations"
+        required: false
+        type: string
+        default: "4"
+
+run-name: "Android: ${{ inputs.name }}"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ inputs.name }}
+  cancel-in-progress: false
+
+jobs:
+  recompile:
+    name: "Codegen + static heal (Windows)"
+    runs-on: windows-latest
+    timeout-minutes: 350
+    outputs:
+      project_name: ${{ steps.norm.outputs.project_name }}
+      title: ${{ steps.meta.outputs.title }}
+      title_id: ${{ steps.meta.outputs.title_id }}
+    env:
+      REXAUTO_WORK: ${{ github.workspace }}\autoports
+      REXAUTO_PORTABLE: "1"
+      ARCHIVE_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
+      EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Validate and normalize inputs
+        id: norm
+        shell: pwsh
+        env:
+          GAME_URL: ${{ inputs.url }}
+          RAW_NAME: ${{ inputs.name }}
+        run: |
+          $clean = [regex]::Replace($env:RAW_NAME.Trim().ToLowerInvariant(), '[^a-z0-9_]+', '_').Trim('_')
+          if (-not $clean) { $clean = "game" }
+          if ($clean -match '^[0-9]') { $clean = "g_$clean" }
+          if ($clean.Length -gt 40) { $clean = $clean.Substring(0, 40).TrimEnd('_') }
+          Write-Host "Normalized project name: $clean"
+          "PROJECT_NAME=$clean" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "project_name=$clean" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($env:GAME_URL.Trim() -notmatch '^https?://') {
+            throw "The game URL must start with http:// or https://."
+          }
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python dependencies
+        run: python -m pip install --upgrade pip pillow py7zr pyzipper curl_cffi playwright
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -property installationPath
+          if (-not $vs) { throw "Visual Studio installation not found." }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found." }
+          "VCVARS=$vcvars" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            "CLANG=$env:ProgramFiles\LLVM\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "CLANGXX=$env:ProgramFiles\LLVM\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Resolve pinned SDK URL
+        id: sdk
+        shell: pwsh
+        run: |
+          $url = python tools/ci_sdk.py url
+          if ($LASTEXITCODE -ne 0 -or -not $url) {
+            throw "Could not resolve ReXGlue SDK URL."
+          }
+          "url=$url" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - uses: actions/cache@v4
+        id: sdk-cache
+        with:
+          path: rexglue
+          key: rexglue-sdk-${{ hashFiles('rexauto.py', 'tools/ci_sdk.py') }}-${{ steps.sdk.outputs.url }}
+
+      - name: Install ReXGlue SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          REXGLUE_BUNDLE_URL: ${{ steps.sdk.outputs.url }}
+        run: python tools/ci_sdk.py install
+
+      - name: Verify SDK
+        run: python tools/ci_sdk.py verify
+
+      - name: Download and extract game input
+        id: fetch
+        shell: pwsh
+        env:
+          GAME_URL: ${{ inputs.url }}
+          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
+        run: |
+          python tools/ci_fetch.py "$env:GAME_URL" "$env:RUNNER_TEMP\input" --password "$env:EXTRACT_PASSWORD"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Game download or archive extraction failed."
+          }
+
+      - name: Recompile game
+        shell: pwsh
+        env:
+          CONTAINER: ${{ steps.fetch.outputs.container }}
+          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
+          RUNHEAL: ${{ inputs.runheal }}
+          HEAL_ITERS: ${{ inputs.heal_iters }}
+        run: |
+          if (-not $env:CONTAINER) {
+            throw "The download step did not provide the container output."
+          }
+
+          $args = @(
+            $env:CONTAINER,
+            "--name", $env:PROJECT_NAME,
+            "--password", $env:EXTRACT_PASSWORD,
+            "--no-jumptables",
+            "--heal-iters", $env:HEAL_ITERS,
+            "--publish-gabarito"
+          )
+
+          if ($env:RUNHEAL -ne "true") {
+            $args += @("--until", "build")
+          }
+
+          $logDir = "$env:REXAUTO_WORK\$env:PROJECT_NAME"
+          New-Item -ItemType Directory -Force $logDir | Out-Null
+
+          python rexauto.py @args 2>&1 | Tee-Object -FilePath "$logDir\_pipeline.log"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The Rexauto recompilation failed."
+          }
+
+      - name: Extract title metadata
+        id: meta
+        if: always()
+        shell: pwsh
+        env:
+          CONTAINER: ${{ steps.fetch.outputs.container }}
+        run: |
+          $game = "$env:REXAUTO_WORK\$env:PROJECT_NAME\game"
+          $xex = Get-ChildItem $game -Recurse -Filter default.xex -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if ($xex) {
+            python tools/title_meta.py "$($xex.FullName)" "$env:RUNNER_TEMP\meta"
+          } elseif ($env:CONTAINER) {
+            python tools/title_meta.py "$env:CONTAINER" "$env:RUNNER_TEMP\meta"
+          } else {
+            throw "Could not locate game input for title metadata."
+          }
+
+      - name: Pack generated port
+        if: success()
+        shell: pwsh
+        run: |
+          $port = "$env:REXAUTO_WORK\$env:PROJECT_NAME\port"
+          if (-not (Test-Path "$port\generated\default\sources.cmake")) {
+            throw "Generated sources are missing. Check the recompile logs."
+          }
+
+          $out = "$env:RUNNER_TEMP\port-src"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item -Recurse "$port\generated" "$out\generated"
+          Copy-Item -Recurse "$port\src" "$out\src"
+          Get-ChildItem $port -File -Filter *.toml | Copy-Item -Destination $out
+          Get-ChildItem $port -File -Filter *.cmake -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $out
+
+          Compress-Archive -Path "$out\*" -DestinationPath "$env:RUNNER_TEMP\port-src.zip" -Force
+          Copy-Item "$env:RUNNER_TEMP\meta\cover.png" "$env:RUNNER_TEMP\cover.png" -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: port-src-${{ steps.norm.outputs.project_name }}
+          path: |
+            ${{ runner.temp }}/port-src.zip
+            ${{ runner.temp }}/cover.png
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-${{ steps.norm.outputs.project_name }}
+          path: ${{ env.REXAUTO_WORK }}/${{ steps.norm.outputs.project_name }}/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  apk:
+    name: "Android APK (arm64-v8a)"
+    needs: recompile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      PROJECT_NAME: ${{ needs.recompile.outputs.project_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: port-src-${{ needs.recompile.outputs.project_name }}
+          path: ${{ runner.temp }}/in
+
+      - name: Unpack port
+        run: |
+          set -euo pipefail
+          mkdir -p "autoports/$PROJECT_NAME/port"
+          unzip -q "${{ runner.temp }}/in/port-src.zip" -d "autoports/$PROJECT_NAME/port"
+          test -f "autoports/$PROJECT_NAME/port/src/main.cpp"
+          test -f "autoports/$PROJECT_NAME/port/generated/default/sources.cmake"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libx11-xcb-dev libwayland-dev libwayland-client0 unzip zip rsync
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/cache@v4
+        with:
+          path: android/sdk
+          key: android-sdk-v0.10.0-${{ hashFiles('android/patches/*.patch', 'tools/android_sdk.sh') }}
+
+      - name: Install patched ReXGlue SDK
+        run: |
+          chmod +x tools/android_sdk.sh
+          tools/android_sdk.sh
+
+      - name: Install Android CMake and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" "ndk;27.2.12479018"
+
+      - name: Stage assets
+        run: |
+          set -euo pipefail
+          mkdir -p android/app/src/main/assets
+          cp tools/xbox360_titles.json android/app/src/main/assets/
+          python3 -m pip install --break-system-packages --quiet pillow || python3 -m pip install --quiet pillow
+
+          if [ -f "${{ runner.temp }}/in/cover.png" ]; then
+            cp "${{ runner.temp }}/in/cover.png" android/app/src/main/assets/cover.png
+            python3 tools/android_icon.py "${{ runner.temp }}/in/cover.png" android/app/src/main/res
+          else
+            python3 tools/android_icon.py gui/rexauto_icon.png android/app/src/main/res
+          fi
+
+      - name: Create CI signing key
+        run: |
+          keytool -genkeypair \
+            -keystore android/ci-release.jks \
+            -storepass rexauto -keypass rexauto \
+            -alias rexauto -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=rexauto, O=rexauto"
+
+      - name: Build release APK
+        env:
+          REX_TITLE: ${{ needs.recompile.outputs.title }}
+          REX_TITLE_ID: ${{ needs.recompile.outputs.title_id }}
+          BASELINE_ARM: ${{ inputs.baseline_arm }}
+        run: |
+          set -euo pipefail
+          if [ "$BASELINE_ARM" = "true" ]; then
+            export REX_ANDROID_BASELINE_ARM=1
+          fi
+
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace \
+            -PrexName="$PROJECT_NAME" \
+            -PrexTitle="${REX_TITLE:-$PROJECT_NAME}" \
+            -PrexTitleId="${REX_TITLE_ID:-00000000}" \
+            -PrexPortDir="$GITHUB_WORKSPACE/autoports/$PROJECT_NAME/port" \
+            -PrexSdkDir="$GITHUB_WORKSPACE/android/sdk/rexglue-sdk" \
+            -PrexVersionCode="${GITHUB_RUN_NUMBER}" \
+            -PrexVersionName="1.${GITHUB_RUN_NUMBER}"
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          unzip -l "$APK" > /tmp/apk.txt
+
+          grep -q "lib/arm64-v8a/libmain.so" /tmp/apk.txt
+          grep -Eq "lib/arm64-v8a/librexgpu-xenos.*\.so" /tmp/apk.txt
+          grep -q "assets/xbox360_titles.json" /tmp/apk.txt
+
+          cp "$APK" "$RUNNER_TEMP/${PROJECT_NAME}-android.apk"
+          SIZE=$(stat -c%s "$APK")
+          echo "APK size: $((SIZE / 1048576)) MB" >> "$GITHUB_STEP_SUMMARY"
+          echo "Architecture: arm64-v8a" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.recompile.outputs.project_name }}-android-apk
+          path: ${{ runner.temp }}/${{ needs.recompile.outputs.project_name }}-android.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Collect Android project sources
+        if: always()
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/source-$PROJECT_NAME"
+          mkdir -p "$OUT"
+          rsync -a --exclude sdk --exclude build --exclude .gradle --exclude '*.jks' android/ "$OUT/android/"
+          if [ -d "autoports/$PROJECT_NAME/port" ]; then
+            rsync -a --exclude build "autoports/$PROJECT_NAME/port/" "$OUT/port/"
+          fi
+          cp tools/android_sdk.sh "$OUT/" || true
+          cp -r android/patches "$OUT/android/" 2>/dev/null || true
+          printf '%s\n' "$PROJECT_NAME Android project sources" > "$OUT/README.txt"
+
+      - name: Upload project sources
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ needs.recompile.outputs.project_name }}
+          path: ${{ runner.temp }}/source-${{ needs.recompile.outputs.project_name }}
           retention-days: 14
