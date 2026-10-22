@@ -69,6 +69,8 @@ def _mediafire_candidates(url):
     elif host.startswith("download"):
         out.append(url)
         parts = [p for p in u.path.split("/") if p]
+        if len(parts) >= 3:
+            out.append("https://www.mediafire.com/file/%s/%s/file" % (parts[1], parts[2]))
         if len(parts) >= 2:
             out.append("https://www.mediafire.com/file/%s/file" % parts[1])
     if url not in out:
