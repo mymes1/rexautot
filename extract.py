@@ -18,11 +18,264 @@ used directly as the game root, so titles extracted by other means (e.g.
 god2iso.ps1) drop straight in with no copy.
 
 Used as a module (extract_container -> (xex_path, game_dir)) or standalone:
-    python extract.py <container> <out_dir>
+    python extract.py <container> <out_dir> [--password <pw>]
 """
 import os
+import re
+import shutil
 import struct
+import subprocess
 import sys
+import tarfile
+import zipfile
+
+DEFAULT_ARCHIVE_PASSWORD = "LegionGamesGod"
+ARCHIVE_EXT = (".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2")
+
+
+def default_password():
+    return (
+        os.environ.get("ARCHIVE_PASSWORD")
+        or os.environ.get("EXTRACT_PASSWORD")
+        or DEFAULT_ARCHIVE_PASSWORD
+    )
+
+
+def candidate_passwords(password=None):
+    seen = []
+    for p in (
+        password,
+        os.environ.get("ARCHIVE_PASSWORD"),
+        os.environ.get("EXTRACT_PASSWORD"),
+        DEFAULT_ARCHIVE_PASSWORD,
+        "",
+    ):
+        if p is not None and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def archive_kind(path):
+    """Identify an archive file by magic header bytes or file extension."""
+    if not path or not os.path.isfile(path):
+        return None
+    low = path.lower()
+    try:
+        with open(path, "rb") as f:
+            head = f.read(0x210)
+    except OSError:
+        head = b""
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+        return "zip"
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    if head[:6] == b"Rar!\x1a\x07":
+        return "rar"
+    if (
+        head[:2] == b"\x1f\x8b"
+        or head[:6] == b"\xfd7zXZ"
+        or head[:3] == b"BZh"
+        or (len(head) >= 0x106 and head[0x101:0x106] == b"ustar")
+    ):
+        return "tar"
+    if low.endswith((".zip", ".zip.001")):
+        return "zip"
+    if low.endswith((".7z", ".7z.001")):
+        return "7z"
+    if low.endswith(".rar"):
+        return "rar"
+    if low.endswith((".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2")):
+        return "tar"
+    return None
+
+
+def is_archive_file(path):
+    return archive_kind(path) is not None
+
+
+def _is_secondary_volume(filename):
+    low = filename.lower()
+    if re.search(r"\.part(?!0*1\.rar$)\d+\.rar$", low):
+        return True
+    if re.search(r"\.r\d{2,}$", low) or re.search(r"\.z\d{2,}$", low):
+        return True
+    if re.search(r"\.\d{3}$", low) and not low.endswith(".001"):
+        return True
+    return False
+
+
+def _find_sevenzip():
+    for c in (
+        "7z",
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+        "7zz",
+        "7za",
+        "7zr",
+    ):
+        p = shutil.which(c) or (c if os.path.isfile(c) else None)
+        if p:
+            return p
+    return None
+
+
+def _unpack_single_archive(path, out_dir, password=None, log=print):
+    kind = archive_kind(path) or "archive"
+    os.makedirs(out_dir, exist_ok=True)
+    passwords = candidate_passwords(password)
+    errors = []
+
+    sz = _find_sevenzip()
+    if sz:
+        for pw in passwords:
+            cmd = [sz, "x", "-y", "-aoa", "-p" + pw, "-o" + out_dir, path]
+            res = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+            )
+            if res.returncode == 0:
+                return out_dir
+            errors.append("7z: " + (res.stdout or "").strip()[-300:])
+
+    if kind == "rar":
+        unrar = shutil.which("unrar")
+        if unrar:
+            for pw in passwords:
+                cmd = [unrar, "x", "-y", "-o+", "-p" + (pw or "-"), path, out_dir + os.sep]
+                res = subprocess.run(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                )
+                if res.returncode == 0:
+                    return out_dir
+                errors.append("unrar: " + (res.stdout or "").strip()[-300:])
+        try:
+            import rarfile  # type: ignore
+            for pw in passwords:
+                try:
+                    with rarfile.RarFile(path) as rf:
+                        rf.extractall(path=out_dir, pwd=pw or None)
+                    return out_dir
+                except Exception as ex:
+                    errors.append("rarfile: %s" % ex)
+        except ImportError:
+            pass
+
+    if kind == "7z":
+        try:
+            import py7zr  # type: ignore
+            for pw in passwords:
+                try:
+                    with py7zr.SevenZipFile(path, mode="r", password=pw or None) as z:
+                        z.extractall(path=out_dir)
+                    return out_dir
+                except Exception as ex:
+                    errors.append("py7zr: %s" % ex)
+        except ImportError:
+            pass
+
+    if kind == "zip":
+        try:
+            import pyzipper  # type: ignore
+            for pw in passwords:
+                try:
+                    with pyzipper.AESZipFile(path, "r") as z:
+                        z.extractall(out_dir, pwd=pw.encode("utf-8") if pw else None)
+                    return out_dir
+                except Exception as ex:
+                    errors.append("pyzipper: %s" % ex)
+        except ImportError:
+            pass
+
+        unzip_bin = shutil.which("unzip")
+        if unzip_bin:
+            for pw in passwords:
+                cmd = [unzip_bin, "-o", "-q"]
+                if pw:
+                    cmd += ["-P", pw]
+                cmd += [path, "-d", out_dir]
+                res = subprocess.run(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                )
+                if res.returncode == 0:
+                    return out_dir
+                errors.append("unzip: " + (res.stdout or "").strip()[-300:])
+
+        for pw in passwords:
+            try:
+                with zipfile.ZipFile(path, "r") as z:
+                    z.extractall(out_dir, pwd=pw.encode("utf-8") if pw else None)
+                return out_dir
+            except Exception as ex:
+                errors.append("zipfile: %s" % ex)
+
+    if kind == "tar":
+        try:
+            with tarfile.open(path, "r:*") as tf:
+                abs_out = os.path.abspath(out_dir)
+                members = []
+                for m in tf.getmembers():
+                    target = os.path.abspath(os.path.join(out_dir, m.name))
+                    if os.path.commonpath([abs_out, target]) == abs_out:
+                        members.append(m)
+                try:
+                    tf.extractall(out_dir, members=members, filter="data")
+                except TypeError:
+                    tf.extractall(out_dir, members=members)
+            return out_dir
+        except Exception as ex:
+            errors.append("tarfile: %s" % ex)
+
+    detail = "; ".join(e for e in errors if e)[:600] or "no suitable extractor installed"
+    raise SystemExit("failed to extract archive %s (%s): %s" % (path, kind, detail))
+
+
+def unpack_archive(path, out_dir, password=None, log=print):
+    """Extract an archive (and any nested archives inside it) using password
+    (defaults to LegionGamesGod)."""
+    pw = password if password is not None else default_password()
+    log("archive -> extracting %s to %s" % (os.path.basename(path), out_dir))
+    _unpack_single_archive(path, out_dir, password=pw, log=log)
+
+    # Also unpack nested archives inside out_dir when the game payload itself is
+    # double-packed (e.g. outer .zip containing a password-protected .rar / .7z).
+    for _round in range(3):
+        if _find_default_xex(out_dir) or find_god_header(out_dir):
+            break
+        nested = []
+        has_container = False
+        for r, _, files in os.walk(out_dir):
+            for fn in sorted(files):
+                p = os.path.join(r, fn)
+                fl = fn.lower()
+                if fl.endswith(".iso") or _looks_like_xex(p):
+                    has_container = True
+                elif not _is_secondary_volume(fn) and is_archive_file(p):
+                    nested.append(p)
+        if has_container or not nested:
+            break
+        for idx, inner in enumerate(nested):
+            sub = os.path.join(os.path.dirname(inner), "_inner_%d" % idx)
+            log("nested archive -> extracting %s" % os.path.basename(inner))
+            _unpack_single_archive(inner, sub, password=pw, log=log)
+            try:
+                os.remove(inner)
+            except OSError:
+                pass
+    return out_dir
 
 BLOCK = 0x1000
 L = [170, 28900, 4913000]
@@ -173,11 +426,14 @@ def title_from_filename(container):
     """A human-readable game title guessed from a container path: drop the
     extension and the region/dump tags '(USA, Europe)', '[!]', etc.
     'Captain America - Super Soldier (USA, Europe).iso' -> 'Captain America - Super Soldier'."""
-    import re
     if not container:
         return None
     base = os.path.basename(str(container).rstrip("/\\"))
-    stem = base if os.path.isdir(container) else os.path.splitext(base)[0]
+    if os.path.isdir(container):
+        stem = base
+    else:
+        cleaned = re.sub(r"\.(?:tar\.(?:gz|xz|bz2)|part\d+\.rar|(?:7z|zip)\.\d{3})$", "", base, flags=re.I)
+        stem = os.path.splitext(cleaned)[0] if cleaned == base else cleaned
     stem = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", "", stem)   # strip (...) [...] {...}
     stem = re.sub(r"\s+", " ", stem).strip(" -_.")
     return stem or None
@@ -275,10 +531,13 @@ def read_package_meta(container):
         meta["title"] = fallback_title
         return meta
     if d[:4] not in (b"CON ", b"LIVE", b"PIRS"):
-        # ISO (GDFX) or raw XEX: no STFS header -> title from the file name, and
-        # (best-effort, for cover art) the title_id read from the default.xex's
-        # XEX2 execution-info header.
+        # Archive (.zip / .7z / .rar), ISO (GDFX) or raw XEX: no STFS header ->
+        # title from the file name, and (best-effort, for cover art) the
+        # title_id read from the default.xex's XEX2 execution-info header.
         meta["title"] = fallback_title
+        if is_archive_file(container):
+            meta["format"] = "ARCHIVE"
+            return meta
         meta["format"] = "XEX" if d[:4] == b"XEX2" else "ISO"
         try:
             meta["title_id"] = _container_title_id(container)
@@ -786,7 +1045,7 @@ def _svod_reader(src, hdr, log):
     return read_sector
 
 
-def find_god_header(folder, max_depth=4):
+def find_god_header(folder, max_depth=8):
     """Locate a GoD (SVOD) header file under a folder: a CON/LIVE/PIRS package
     whose volume type is SVOD -- e.g. '<title>/4D530A26/00007000/58F54A32...'.
     Prefers a header that has its '.data' fragment folder beside it. Returns
@@ -816,23 +1075,106 @@ def find_god_header(folder, max_depth=4):
     return best
 
 
-def extract_container(src, out_dir, log=print):
+def pick_unpacked_container(root):
+    """Select the best container inside an unpacked directory or single file:
+    a folder containing default.xex, an ISO, a GoD header, an STFS package, or
+    a renamed raw XEX."""
+    if os.path.isfile(root):
+        if _looks_like_xex(root):
+            folder = os.path.dirname(root)
+            want = os.path.join(folder, "default.xex")
+            if os.path.abspath(root) != os.path.abspath(want):
+                shutil.move(root, want)
+            return folder
+        return root
+    xexes, isos, stfs_pkgs, others = [], [], [], []
+    for r, _, files in os.walk(root):
+        for fn in files:
+            p = os.path.join(r, fn)
+            fl = fn.lower()
+            if fl == "default.xex":
+                xexes.append(p)
+            elif fl.endswith(".iso"):
+                isos.append(p)
+            elif _looks_like_xex(p) and not fl.endswith(".xexp"):
+                others.append(p)
+            else:
+                try:
+                    if os.path.getsize(p) >= 0x3B0:
+                        with open(p, "rb") as f:
+                            hdr = f.read(0x3B0)
+                        if hdr[:4] in (b"CON ", b"LIVE", b"PIRS"):
+                            vol_type = struct.unpack_from(">I", hdr, 0x3A9)[0]
+                            if vol_type != 1:
+                                stfs_pkgs.append(p)
+                except OSError:
+                    pass
+    if xexes:
+        return os.path.dirname(sorted(xexes, key=len)[0])
+    if isos:
+        return sorted(isos, key=lambda p: -os.path.getsize(p))[0]
+    god = find_god_header(root)
+    if god:
+        return god
+    if stfs_pkgs:
+        return sorted(stfs_pkgs, key=lambda p: -os.path.getsize(p))[0]
+    if others:
+        return pick_unpacked_container(others[0])
+    return root
+
+
+def extract_container(src, out_dir, log=print, password=None):
     """Return (default_xex_path, game_dir). game_dir is the folder to use as the
     ReXGlue game root (it always contains the returned default.xex)."""
+    pw = password if password is not None else default_password()
     src = normalize_container(src)
     if not os.path.exists(src):
         raise SystemExit("container not found: %s" % src)
+
+    if os.path.isfile(src) and is_archive_file(src):
+        stage_dir = os.path.abspath(out_dir).rstrip("/\\") + "._archive"
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        try:
+            unpack_archive(src, stage_dir, password=pw, log=log)
+            inner = pick_unpacked_container(stage_dir)
+            if os.path.isdir(inner):
+                xex = _find_default_xex(inner)
+                if not xex:
+                    raise SystemExit("archive has no default.xex, ISO, STFS or GoD package: %s" % src)
+                gdir = os.path.dirname(xex)
+                os.makedirs(out_dir, exist_ok=True)
+                for name in os.listdir(gdir):
+                    s_item = os.path.join(gdir, name)
+                    d_item = os.path.join(out_dir, name)
+                    if os.path.exists(d_item):
+                        if os.path.isdir(d_item):
+                            shutil.rmtree(d_item)
+                        else:
+                            os.remove(d_item)
+                    shutil.move(s_item, d_item)
+                return extract_container(out_dir, out_dir, log=log, password=pw)
+            return extract_container(inner, out_dir, log=log, password=pw)
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     # already-extracted folder: use it in place, no copy
     if os.path.isdir(src):
         xex = _find_default_xex(src)
         if not xex:
             # not extracted -- maybe a GoD folder ('<title>/<TITLEID>/00007000/<hdr>'
-            # + '<hdr>.data/Data0000..'); resolve the header and extract that.
+            # + '<hdr>.data/Data0000..'), an ISO/STFS file, or an archive inside it.
             hdr = find_god_header(src)
             if hdr:
                 log("GoD folder -> header %s" % os.path.relpath(hdr, src))
-                return extract_container(hdr, out_dir, log)
+                return extract_container(hdr, out_dir, log=log, password=pw)
+            picked = pick_unpacked_container(src)
+            if os.path.isfile(picked):
+                return extract_container(picked, out_dir, log=log, password=pw)
+            for r, _, files in os.walk(src):
+                for fn in sorted(files):
+                    p = os.path.join(r, fn)
+                    if not _is_secondary_volume(fn) and is_archive_file(p):
+                        return extract_container(p, out_dir, log=log, password=pw)
             raise SystemExit("folder has no default.xex and no GoD package: %s" % src)
         log("using extracted game folder in place: %s" % src)
         # A hand-extracted folder can silently carry the scars of a truncated
@@ -962,4 +1304,11 @@ def extract_container(src, out_dir, log=print):
 
 
 if __name__ == "__main__":
-    print(extract_container(sys.argv[1], sys.argv[2]))
+    import argparse
+    _ap = argparse.ArgumentParser(description="Extract Xbox 360 container or archive.")
+    _ap.add_argument("container")
+    _ap.add_argument("out_dir")
+    _ap.add_argument("-p", "--password", default=default_password(),
+                     help="Password to extract encrypted archives (default: %s)" % DEFAULT_ARCHIVE_PASSWORD)
+    _a = _ap.parse_args()
+    print(extract_container(_a.container, _a.out_dir, password=_a.password))

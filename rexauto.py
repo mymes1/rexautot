@@ -612,7 +612,10 @@ def add_includes(ctx, names, manifest=None):
 
 # ------------------------------------------------------------------------ stages
 def stage_extract(ctx):
-    xex, game_dir = _extract.extract_container(ctx.args.container, ctx._game_out, log=ctx.log)
+    pw = getattr(ctx.args, "password", None) or _extract.default_password()
+    xex, game_dir = _extract.extract_container(
+        ctx.args.container, ctx._game_out, log=ctx.log, password=pw
+    )
     ctx.game, ctx.xex = game_dir, xex
     info = {"xex": xex, "game_dir": game_dir}
     # Generic auto-title-update. detect_title_update stages a matching XEX delta
@@ -4688,8 +4691,10 @@ def preflight(env, args=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("container", help="STFS package, GoD header file or folder, Xbox 360 ISO, or a folder containing default.xex")
+    ap.add_argument("container", help="STFS package, GoD header file or folder, Xbox 360 ISO, .zip/.7z/.rar archive, or a folder containing default.xex")
     ap.add_argument("--name", required=True, help="project name (a-z0-9_)")
+    ap.add_argument("--password", default=_extract.default_password(),
+                    help="password to extract encrypted archives (default: %s)" % _extract.DEFAULT_ARCHIVE_PASSWORD)
     ap.add_argument("--work", default=os.environ.get("REXAUTO_WORK", r"C:\Skate3\autoports"),
                     help="output root (or env REXAUTO_WORK)")
     ap.add_argument("--run", action="store_true", help="launch the game at the end")

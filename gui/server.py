@@ -53,12 +53,13 @@ def _port_dir(name):
     return os.path.join(work, name, "port")
 
 
-def pipeline_command(container, name, do_run, patches=None):
+def pipeline_command(container, name, do_run, patches=None, password=None):
     """Frozen app re-invokes itself in pipeline mode; a script run calls rexauto.py."""
+    pw = password or _extract.default_password()
     if FROZEN:
-        cmd = [sys.executable, "--__pipeline", container, "--name", name]
+        cmd = [sys.executable, "--__pipeline", container, "--name", name, "--password", pw]
     else:
-        cmd = [sys.executable, "-u", os.path.join(ROOT, "rexauto.py"), container, "--name", name]
+        cmd = [sys.executable, "-u", os.path.join(ROOT, "rexauto.py"), container, "--name", name, "--password", pw]
     if do_run:
         cmd.append("--run")
     # A selecao da tela e a verdade completa: mandar --no-patches quando ela esta
@@ -121,7 +122,7 @@ class Hub:
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, container, name, do_run, patches=None):
+    def start(self, container, name, do_run, patches=None, password=None):
         if self.running():
             self.emit({"type": "log", "level": "warn", "text": "a pipeline is already running"})
             return
@@ -133,7 +134,7 @@ class Hub:
                    "title_id": meta.get("title_id"), "cover": cover, "format": meta.get("format"),
                    "container": container, "name": name})
         self.emit({"type": "stage", "stage": "extract", "status": "pending"})
-        threading.Thread(target=self._run, args=(container, name, do_run, patches), daemon=True).start()
+        threading.Thread(target=self._run, args=(container, name, do_run, patches, password), daemon=True).start()
 
     def stop(self):
         if self.running():
@@ -144,8 +145,8 @@ class Hub:
             self.emit({"type": "log", "level": "warn", "text": "stopped by user"})
             self.emit({"type": "done", "ok": False, "message": "stopped"})
 
-    def _run(self, container, name, do_run, patches=None):
-        cmd = pipeline_command(container, name, do_run, patches)
+    def _run(self, container, name, do_run, patches=None, password=None):
+        cmd = pipeline_command(container, name, do_run, patches, password)
         self.emit({"type": "status", "text": "starting pipeline"})
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -333,7 +334,10 @@ class Handler(BaseHTTPRequestHandler):
                     HUB.emit({"type": "log", "level": "warn", "text": "memory: " + _mem})
             except Exception:
                 pass
-            HUB.start(container, name, bool(data.get("run")), data.get("patches"))
+            HUB.start(
+                container, name, bool(data.get("run")),
+                data.get("patches"), (data.get("password") or "").strip() or None,
+            )
             return self._send(200, "application/json", json.dumps({"ok": True}))
         if u.path == "/api/patches":
             name = (data.get("name") or "").strip()

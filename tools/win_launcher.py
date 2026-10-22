@@ -52,6 +52,7 @@ DEFAULTS = {
     "fullscreen": False,
     "tolerant": True,
     "extra": "",
+    "password": "LegionGamesGod",
 }
 PRESETS = ["performance", "balanced", "accuracy"]
 EFFECTS = ["bilinear", "cas", "fsr"]
@@ -276,8 +277,13 @@ class App(tk.Tk):
         self.game_lbl.pack(anchor="w", pady=(0, 10))
         row = ttk.Frame(t, style="Card.TFrame")
         row.pack(anchor="w", pady=(0, 6))
-        ttk.Button(row, text="Choose ISO / XBLA package / default.xex…", command=self.on_pick_file).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Choose ISO / XBLA / Archive (.zip/.7z/.rar)…", command=self.on_pick_file).pack(side="left", padx=(0, 8))
         ttk.Button(row, text="Choose folder (GoD / extracted)…", command=self.on_pick_folder).pack(side="left")
+        pw_row = ttk.Frame(t, style="Card.TFrame")
+        pw_row.pack(anchor="w", pady=(2, 4))
+        ttk.Label(pw_row, text="Archive password:", style="Muted.TLabel").pack(side="left", padx=(0, 8))
+        self.v_password = tk.StringVar(value=self.s.get("password") or "LegionGamesGod")
+        ttk.Entry(pw_row, textvariable=self.v_password, width=28).pack(side="left")
         ttk.Label(t, text="Files are unpacked into  assets\\  next to the exe. Drop-in also works: copy the game folder\n"
                           "(default.xex + everything beside it) into assets\\ yourself.", style="Muted.TLabel",
                   justify="left").pack(anchor="w", pady=(4, 8))
@@ -335,6 +341,7 @@ class App(tk.Tk):
                 "present_effect": self.v_eff.get(), "video_mode": self.v_mode.get().strip() or "1280x720",
                 "letterbox": self.v_lb.get(), "fullscreen": self.v_fs.get(), "tolerant": self.v_tol.get(),
                 "extra": self.extra.get("1.0", "end").strip(),
+                "password": self.v_password.get().strip() or "LegionGamesGod",
             })
             save_settings(self.s)
             self.set_status("settings saved")
@@ -364,8 +371,8 @@ class App(tk.Tk):
             self.set_status("game exe not found next to the launcher")
 
     def on_pick_file(self):
-        p = filedialog.askopenfilename(title="Xbox 360 dump", filetypes=[
-            ("Xbox 360 game", "*.iso *.xex *.zip *"), ("All files", "*")])
+        p = filedialog.askopenfilename(title="Xbox 360 dump or archive", filetypes=[
+            ("Xbox 360 game", "*.iso *.xex *.zip *.7z *.rar *"), ("All files", "*")])
         if p:
             self.start_extract(p)
 
@@ -378,11 +385,17 @@ class App(tk.Tk):
         if _extract is None:
             messagebox.showerror("Extract", "extract.py is missing next to the launcher")
             return
+        pw = self.v_password.get().strip() or _extract.default_password()
+        self.s["password"] = pw
+        try:
+            save_settings(self.s)
+        except Exception:
+            pass
         self.prog.start(12)
         self.set_status("unpacking…")
-        threading.Thread(target=self._extract, args=(src,), daemon=True).start()
+        threading.Thread(target=self._extract, args=(src, pw), daemon=True).start()
 
-    def _extract(self, src):
+    def _extract(self, src, pw="LegionGamesGod"):
         try:
             os.makedirs(ASSETS, exist_ok=True)
             if os.path.isdir(src) and _extract._find_default_xex(src):
@@ -398,7 +411,7 @@ class App(tk.Tk):
                     for fn in files:
                         shutil.copy2(os.path.join(r, fn), os.path.join(dst, fn))
             else:
-                _extract.extract_container(src, ASSETS, log=self.log)
+                _extract.extract_container(src, ASSETS, log=self.log, password=pw)
             # cover from an STFS header if we have none yet
             try:
                 if not os.path.isfile(os.path.join(HERE, "cover.png")):
