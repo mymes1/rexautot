@@ -49,7 +49,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 350
     outputs:
-      project_name: ${{ steps.norm.outputs.project_name }}
+      project_name: ${{ steps.prep.outputs.project_name }}
       title: ${{ steps.meta.outputs.title }}
       title_id: ${{ steps.meta.outputs.title_id }}
     env:
@@ -61,161 +61,53 @@ jobs:
       PYTHONIOENCODING: "utf-8"
 
     steps:
-      - name: Validate and normalize inputs
-        id: norm
-        shell: pwsh
-        env:
-          GAME_URL: ${{ inputs.url }}
-          RAW_NAME: ${{ inputs.name }}
-        run: |
-          $clean = [regex]::Replace($env:RAW_NAME.Trim().ToLowerInvariant(), '[^a-z0-9_]+', '_').Trim('_')
-          if (-not $clean) { $clean = "game" }
-          if ($clean -match '^[0-9]') { $clean = "g_$clean" }
-          if ($clean.Length -gt 40) { $clean = $clean.Substring(0, 40).TrimEnd('_') }
-          Write-Host "Normalized project name: $clean"
-          "PROJECT_NAME=$clean" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "project_name=$clean" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          if ($env:GAME_URL.Trim() -notmatch '^https?://') {
-            throw "The game URL must start with http:// or https://."
-          }
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Python dependencies
-        run: python -m pip install --upgrade pip pillow py7zr pyzipper curl_cffi playwright
-
-      - name: Toolchain
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products '*' -property installationPath
-          if (-not $vs) { throw "Visual Studio installation not found." }
-          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found." }
-          "VCVARS=$vcvars" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
-            "CLANG=$env:ProgramFiles\LLVM\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            "CLANGXX=$env:ProgramFiles\LLVM\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
-
-      - name: Resolve pinned SDK URL
-        id: sdk
-        shell: pwsh
-        run: |
-          $url = python tools/ci_sdk.py url
-          if ($LASTEXITCODE -ne 0 -or -not $url) {
-            throw "Could not resolve ReXGlue SDK URL."
-          }
-          "url=$url" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Prepare inputs and Windows toolchain
+        id: prep
+        env:
+          GAME_URL: ${{ inputs.url }}
+          RAW_NAME: ${{ inputs.name }}
+        run: python tools/ci_main.py prepare-windows
 
       - uses: actions/cache@v4
         id: sdk-cache
         with:
           path: rexglue
-          key: rexglue-sdk-${{ hashFiles('rexauto.py', 'tools/ci_sdk.py') }}-${{ steps.sdk.outputs.url }}
+          key: rexglue-sdk-${{ hashFiles('rexauto.py', 'tools/ci_sdk.py') }}-${{ steps.prep.outputs.sdk_url }}
 
-      - name: Install ReXGlue SDK
-        if: steps.sdk-cache.outputs.cache-hit != 'true'
-        shell: pwsh
+      - name: Install and verify ReXGlue SDK
         env:
-          REXGLUE_BUNDLE_URL: ${{ steps.sdk.outputs.url }}
-        run: python tools/ci_sdk.py install
-
-      - name: Verify SDK
-        run: python tools/ci_sdk.py verify
+          CACHE_HIT: ${{ steps.sdk-cache.outputs.cache-hit }}
+          REXGLUE_BUNDLE_URL: ${{ steps.prep.outputs.sdk_url }}
+        run: python tools/ci_main.py setup-sdk
 
       - name: Download and extract game input
         id: fetch
-        shell: pwsh
         env:
           GAME_URL: ${{ inputs.url }}
-          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
-        run: |
-          python tools/ci_fetch.py "$env:GAME_URL" "$env:RUNNER_TEMP\input" --password "$env:EXTRACT_PASSWORD"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Game download or archive extraction failed."
-          }
+        run: python tools/ci_main.py fetch
 
       - name: Recompile game
-        shell: pwsh
         env:
           CONTAINER: ${{ steps.fetch.outputs.container }}
-          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
           RUNHEAL: ${{ inputs.runheal }}
           HEAL_ITERS: ${{ inputs.heal_iters }}
-        run: |
-          if (-not $env:CONTAINER) {
-            throw "The download step did not provide the container output."
-          }
+        run: python tools/ci_main.py recompile
 
-          $args = @(
-            $env:CONTAINER,
-            "--name", $env:PROJECT_NAME,
-            "--password", $env:EXTRACT_PASSWORD,
-            "--no-jumptables",
-            "--heal-iters", $env:HEAL_ITERS,
-            "--publish-gabarito"
-          )
-
-          if ($env:RUNHEAL -ne "true") {
-            $args += @("--until", "build")
-          }
-
-          $logDir = "$env:REXAUTO_WORK\$env:PROJECT_NAME"
-          New-Item -ItemType Directory -Force $logDir | Out-Null
-
-          python rexauto.py @args 2>&1 | Tee-Object -FilePath "$logDir\_pipeline.log"
-          if ($LASTEXITCODE -ne 0) {
-            throw "The Rexauto recompilation failed."
-          }
-
-      - name: Extract title metadata
+      - name: Extract metadata and pack port
         id: meta
-        if: always()
-        shell: pwsh
         env:
           CONTAINER: ${{ steps.fetch.outputs.container }}
-        run: |
-          $game = "$env:REXAUTO_WORK\$env:PROJECT_NAME\game"
-          $xex = Get-ChildItem $game -Recurse -Filter default.xex -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-          if ($xex) {
-            python tools/title_meta.py "$($xex.FullName)" "$env:RUNNER_TEMP\meta"
-          } elseif ($env:CONTAINER) {
-            python tools/title_meta.py "$env:CONTAINER" "$env:RUNNER_TEMP\meta"
-          } else {
-            throw "Could not locate game input for title metadata."
-          }
-
-      - name: Pack generated port
-        if: success()
-        shell: pwsh
-        run: |
-          $port = "$env:REXAUTO_WORK\$env:PROJECT_NAME\port"
-          if (-not (Test-Path "$port\generated\default\sources.cmake")) {
-            throw "Generated sources are missing. Check the recompile logs."
-          }
-
-          $out = "$env:RUNNER_TEMP\port-src"
-          New-Item -ItemType Directory -Force $out | Out-Null
-          Copy-Item -Recurse "$port\generated" "$out\generated"
-          Copy-Item -Recurse "$port\src" "$out\src"
-          Get-ChildItem $port -File -Filter *.toml | Copy-Item -Destination $out
-          Get-ChildItem $port -File -Filter *.cmake -ErrorAction SilentlyContinue |
-            Copy-Item -Destination $out
-
-          Compress-Archive -Path "$out\*" -DestinationPath "$env:RUNNER_TEMP\port-src.zip" -Force
-          Copy-Item "$env:RUNNER_TEMP\meta\cover.png" "$env:RUNNER_TEMP\cover.png" -ErrorAction SilentlyContinue
+        run: python tools/ci_main.py pack-port
 
       - uses: actions/upload-artifact@v4
-        if: success()
         with:
-          name: port-src-${{ steps.norm.outputs.project_name }}
+          name: port-src-${{ steps.prep.outputs.project_name }}
           path: |
             ${{ runner.temp }}/port-src.zip
             ${{ runner.temp }}/cover.png
@@ -226,8 +118,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-windows-${{ steps.norm.outputs.project_name }}
-          path: ${{ env.REXAUTO_WORK }}/${{ steps.norm.outputs.project_name }}/*.log
+          name: logs-windows-${{ steps.prep.outputs.project_name }}
+          path: ${{ env.REXAUTO_WORK }}/${{ steps.prep.outputs.project_name }}/*.log
           if-no-files-found: ignore
           retention-days: 14
 
@@ -247,19 +139,6 @@ jobs:
           name: port-src-${{ needs.recompile.outputs.project_name }}
           path: ${{ runner.temp }}/in
 
-      - name: Unpack port
-        run: |
-          set -euo pipefail
-          mkdir -p "autoports/$PROJECT_NAME/port"
-          unzip -q "${{ runner.temp }}/in/port-src.zip" -d "autoports/$PROJECT_NAME/port"
-          test -f "autoports/$PROJECT_NAME/port/src/main.cpp"
-          test -f "autoports/$PROJECT_NAME/port/generated/default/sources.cmake"
-
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libx11-xcb-dev libwayland-dev libwayland-client0 unzip zip rsync
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -270,76 +149,12 @@ jobs:
           path: android/sdk
           key: android-sdk-v0.10.0-${{ hashFiles('android/patches/*.patch', 'tools/android_sdk.sh') }}
 
-      - name: Install patched ReXGlue SDK
-        run: |
-          chmod +x tools/android_sdk.sh
-          tools/android_sdk.sh
-
-      - name: Install Android CMake and NDK
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" "ndk;27.2.12479018"
-
-      - name: Stage assets
-        run: |
-          set -euo pipefail
-          mkdir -p android/app/src/main/assets
-          cp tools/xbox360_titles.json android/app/src/main/assets/
-          python3 -m pip install --break-system-packages --quiet pillow || python3 -m pip install --quiet pillow
-
-          if [ -f "${{ runner.temp }}/in/cover.png" ]; then
-            cp "${{ runner.temp }}/in/cover.png" android/app/src/main/assets/cover.png
-            python3 tools/android_icon.py "${{ runner.temp }}/in/cover.png" android/app/src/main/res
-          else
-            python3 tools/android_icon.py gui/rexauto_icon.png android/app/src/main/res
-          fi
-
-      - name: Create CI signing key
-        run: |
-          keytool -genkeypair \
-            -keystore android/ci-release.jks \
-            -storepass rexauto -keypass rexauto \
-            -alias rexauto -keyalg RSA -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=rexauto, O=rexauto"
-
-      - name: Build release APK
+      - name: Build and verify Android APK
         env:
           REX_TITLE: ${{ needs.recompile.outputs.title }}
           REX_TITLE_ID: ${{ needs.recompile.outputs.title_id }}
           BASELINE_ARM: ${{ inputs.baseline_arm }}
-        run: |
-          set -euo pipefail
-          if [ "$BASELINE_ARM" = "true" ]; then
-            export REX_ANDROID_BASELINE_ARM=1
-          fi
-
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace \
-            -PrexName="$PROJECT_NAME" \
-            -PrexTitle="${REX_TITLE:-$PROJECT_NAME}" \
-            -PrexTitleId="${REX_TITLE_ID:-00000000}" \
-            -PrexPortDir="$GITHUB_WORKSPACE/autoports/$PROJECT_NAME/port" \
-            -PrexSdkDir="$GITHUB_WORKSPACE/android/sdk/rexglue-sdk" \
-            -PrexVersionCode="${GITHUB_RUN_NUMBER}" \
-            -PrexVersionName="1.${GITHUB_RUN_NUMBER}"
-
-      - name: Verify APK
-        run: |
-          set -euo pipefail
-          APK=android/app/build/outputs/apk/release/app-release.apk
-          test -f "$APK"
-          unzip -l "$APK" > /tmp/apk.txt
-
-          grep -q "lib/arm64-v8a/libmain.so" /tmp/apk.txt
-          grep -Eq "lib/arm64-v8a/librexgpu-xenos.*\.so" /tmp/apk.txt
-          grep -q "assets/xbox360_titles.json" /tmp/apk.txt
-
-          cp "$APK" "$RUNNER_TEMP/${PROJECT_NAME}-android.apk"
-          SIZE=$(stat -c%s "$APK")
-          echo "APK size: $((SIZE / 1048576)) MB" >> "$GITHUB_STEP_SUMMARY"
-          echo "Architecture: arm64-v8a" >> "$GITHUB_STEP_SUMMARY"
+        run: python3 tools/ci_main.py build-apk
 
       - uses: actions/upload-artifact@v4
         with:
@@ -350,17 +165,7 @@ jobs:
 
       - name: Collect Android project sources
         if: always()
-        run: |
-          set -uo pipefail
-          OUT="$RUNNER_TEMP/source-$PROJECT_NAME"
-          mkdir -p "$OUT"
-          rsync -a --exclude sdk --exclude build --exclude .gradle --exclude '*.jks' android/ "$OUT/android/"
-          if [ -d "autoports/$PROJECT_NAME/port" ]; then
-            rsync -a --exclude build "autoports/$PROJECT_NAME/port/" "$OUT/port/"
-          fi
-          cp tools/android_sdk.sh "$OUT/" || true
-          cp -r android/patches "$OUT/android/" 2>/dev/null || true
-          printf '%s\n' "$PROJECT_NAME Android project sources" > "$OUT/README.txt"
+        run: python3 tools/ci_main.py collect-sources
 
       - name: Upload project sources
         if: always()
@@ -380,386 +185,4 @@ jobs:
             android/app/.cxx/**/CMakeOutput.log
             android/app/.cxx/**/CMakeError.log
           if-no-files-found: ignore
-          retention-days: 14
-### Why that `HTTP Error 403: Forbidden` happened (and how it's fixed)
-1. Your `download2393.mediafire.com/<token>/ubdhf5n6eud48u2/DBX-XEX.rar` direct link contained an IP-bound token that expired on the GitHub runner IP, and when `urllib.request` tried to open the clean MediaFire share page, Cloudflare blocked Python `urllib`'s TLS fingerprint with **`403 Forbidden`**.
-2. I updated and **already pushed** `tools/ci_fetch.py` to your `arena/c9cf5f5c-rexautot` branch on GitHub (`7cd304d`) with:
-   - **`curl_cffi` (`impersonate="chrome"`)** so requests use genuine Chrome TLS/HTTP2 fingerprints instead of `urllib` (reconstructing `https://www.mediafire.com/file/ubdhf5n6eud48u2/DBX-XEX.rar/file` cleanly if the direct download token expired).
-   - **Real Chrome / Edge browser fallback (`playwright`)** on the Windows runner that opens the page, clicks `#downloadButton` / solves JS checks natively, and saves the file if MediaFire/Cloudflare requires JavaScript.
-   - Automatic extraction of `.rar`, `.7z`, and `.zip` archives using password **`LegionGamesGod`**.
-
-### Full `.github/workflows/main.yml` for Copy & Paste
-Paste this into `.github/workflows/main.yml` on branch `arena/c9cf5f5c-rexautot`:
-
-```yaml
-name: Recompile for Android
-
-on:
-  workflow_dispatch:
-    inputs:
-      url:
-        description: "Link direto do jogo Xbox 360"
-        required: true
-        type: string
-        default: "https://download2393.mediafire.com/b7kgzwaef0egozKKxpDUp9ynHoW3loUHnC7Yg5RhG7_htzTAnJY5qC1pQinMiJ0-Uo0Sd4FZu6G3MtpVxujq8IoUV4AD-NWYUJMMatrlpDGQWQDaufJguRuWCznILI_GX2nT5P6l9QOzhoewrJs_KGvkGxOXBhO4WQ80l-hXvREX/ubdhf5n6eud48u2/DBX-XEX.rar"
-      name:
-        description: "Nome do projeto e APK"
-        required: true
-        type: string
-        default: "db_xenoverse_recomp"
-      password:
-        description: "Password to extract archive"
-        required: false
-        type: string
-        default: "LegionGamesGod"
-      baseline_arm:
-        description: "Build for ARMv8.0"
-        required: false
-        type: boolean
-        default: false
-      runheal:
-        description: "Run the Windows run-heal loop"
-        required: false
-        type: boolean
-        default: false
-      heal_iters:
-        description: "Max run-heal iterations"
-        required: false
-        type: string
-        default: "4"
-
-run-name: "Android: ${{ inputs.name }}"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: android-${{ inputs.name }}
-  cancel-in-progress: false
-
-jobs:
-  recompile:
-    name: "Codegen + static heal (Windows)"
-    runs-on: windows-latest
-    timeout-minutes: 350
-    outputs:
-      project_name: ${{ steps.norm.outputs.project_name }}
-      title: ${{ steps.meta.outputs.title }}
-      title_id: ${{ steps.meta.outputs.title_id }}
-    env:
-      REXAUTO_WORK: ${{ github.workspace }}\autoports
-      REXAUTO_PORTABLE: "1"
-      ARCHIVE_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
-      EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
-
-    steps:
-      - name: Validate and normalize inputs
-        id: norm
-        shell: pwsh
-        env:
-          GAME_URL: ${{ inputs.url }}
-          RAW_NAME: ${{ inputs.name }}
-        run: |
-          $clean = [regex]::Replace($env:RAW_NAME.Trim().ToLowerInvariant(), '[^a-z0-9_]+', '_').Trim('_')
-          if (-not $clean) { $clean = "game" }
-          if ($clean -match '^[0-9]') { $clean = "g_$clean" }
-          if ($clean.Length -gt 40) { $clean = $clean.Substring(0, 40).TrimEnd('_') }
-          Write-Host "Normalized project name: $clean"
-          "PROJECT_NAME=$clean" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "project_name=$clean" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          if ($env:GAME_URL.Trim() -notmatch '^https?://') {
-            throw "The game URL must start with http:// or https://."
-          }
-
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Python dependencies
-        run: python -m pip install --upgrade pip pillow py7zr pyzipper curl_cffi playwright
-
-      - name: Toolchain
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products '*' -property installationPath
-          if (-not $vs) { throw "Visual Studio installation not found." }
-          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found." }
-          "VCVARS=$vcvars" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
-            "CLANG=$env:ProgramFiles\LLVM\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            "CLANGXX=$env:ProgramFiles\LLVM\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
-
-      - name: Resolve pinned SDK URL
-        id: sdk
-        shell: pwsh
-        run: |
-          $url = python tools/ci_sdk.py url
-          if ($LASTEXITCODE -ne 0 -or -not $url) {
-            throw "Could not resolve ReXGlue SDK URL."
-          }
-          "url=$url" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - uses: actions/cache@v4
-        id: sdk-cache
-        with:
-          path: rexglue
-          key: rexglue-sdk-${{ hashFiles('rexauto.py', 'tools/ci_sdk.py') }}-${{ steps.sdk.outputs.url }}
-
-      - name: Install ReXGlue SDK
-        if: steps.sdk-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        env:
-          REXGLUE_BUNDLE_URL: ${{ steps.sdk.outputs.url }}
-        run: python tools/ci_sdk.py install
-
-      - name: Verify SDK
-        run: python tools/ci_sdk.py verify
-
-      - name: Download and extract game input
-        id: fetch
-        shell: pwsh
-        env:
-          GAME_URL: ${{ inputs.url }}
-          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
-        run: |
-          python tools/ci_fetch.py "$env:GAME_URL" "$env:RUNNER_TEMP\input" --password "$env:EXTRACT_PASSWORD"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Game download or archive extraction failed."
-          }
-
-      - name: Recompile game
-        shell: pwsh
-        env:
-          CONTAINER: ${{ steps.fetch.outputs.container }}
-          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
-          RUNHEAL: ${{ inputs.runheal }}
-          HEAL_ITERS: ${{ inputs.heal_iters }}
-        run: |
-          if (-not $env:CONTAINER) {
-            throw "The download step did not provide the container output."
-          }
-
-          $args = @(
-            $env:CONTAINER,
-            "--name", $env:PROJECT_NAME,
-            "--password", $env:EXTRACT_PASSWORD,
-            "--no-jumptables",
-            "--heal-iters", $env:HEAL_ITERS,
-            "--publish-gabarito"
-          )
-
-          if ($env:RUNHEAL -ne "true") {
-            $args += @("--until", "build")
-          }
-
-          $logDir = "$env:REXAUTO_WORK\$env:PROJECT_NAME"
-          New-Item -ItemType Directory -Force $logDir | Out-Null
-
-          python rexauto.py @args 2>&1 | Tee-Object -FilePath "$logDir\_pipeline.log"
-          if ($LASTEXITCODE -ne 0) {
-            throw "The Rexauto recompilation failed."
-          }
-
-      - name: Extract title metadata
-        id: meta
-        if: always()
-        shell: pwsh
-        env:
-          CONTAINER: ${{ steps.fetch.outputs.container }}
-        run: |
-          $game = "$env:REXAUTO_WORK\$env:PROJECT_NAME\game"
-          $xex = Get-ChildItem $game -Recurse -Filter default.xex -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-          if ($xex) {
-            python tools/title_meta.py "$($xex.FullName)" "$env:RUNNER_TEMP\meta"
-          } elseif ($env:CONTAINER) {
-            python tools/title_meta.py "$env:CONTAINER" "$env:RUNNER_TEMP\meta"
-          } else {
-            throw "Could not locate game input for title metadata."
-          }
-
-      - name: Pack generated port
-        if: success()
-        shell: pwsh
-        run: |
-          $port = "$env:REXAUTO_WORK\$env:PROJECT_NAME\port"
-          if (-not (Test-Path "$port\generated\default\sources.cmake")) {
-            throw "Generated sources are missing. Check the recompile logs."
-          }
-
-          $out = "$env:RUNNER_TEMP\port-src"
-          New-Item -ItemType Directory -Force $out | Out-Null
-          Copy-Item -Recurse "$port\generated" "$out\generated"
-          Copy-Item -Recurse "$port\src" "$out\src"
-          Get-ChildItem $port -File -Filter *.toml | Copy-Item -Destination $out
-          Get-ChildItem $port -File -Filter *.cmake -ErrorAction SilentlyContinue |
-            Copy-Item -Destination $out
-
-          Compress-Archive -Path "$out\*" -DestinationPath "$env:RUNNER_TEMP\port-src.zip" -Force
-          Copy-Item "$env:RUNNER_TEMP\meta\cover.png" "$env:RUNNER_TEMP\cover.png" -ErrorAction SilentlyContinue
-
-      - uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: port-src-${{ steps.norm.outputs.project_name }}
-          path: |
-            ${{ runner.temp }}/port-src.zip
-            ${{ runner.temp }}/cover.png
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload Windows logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-windows-${{ steps.norm.outputs.project_name }}
-          path: ${{ env.REXAUTO_WORK }}/${{ steps.norm.outputs.project_name }}/*.log
-          if-no-files-found: ignore
-          retention-days: 14
-
-  apk:
-    name: "Android APK (arm64-v8a)"
-    needs: recompile
-    runs-on: ubuntu-24.04
-    timeout-minutes: 300
-    env:
-      PROJECT_NAME: ${{ needs.recompile.outputs.project_name }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: port-src-${{ needs.recompile.outputs.project_name }}
-          path: ${{ runner.temp }}/in
-
-      - name: Unpack port
-        run: |
-          set -euo pipefail
-          mkdir -p "autoports/$PROJECT_NAME/port"
-          unzip -q "${{ runner.temp }}/in/port-src.zip" -d "autoports/$PROJECT_NAME/port"
-          test -f "autoports/$PROJECT_NAME/port/src/main.cpp"
-          test -f "autoports/$PROJECT_NAME/port/generated/default/sources.cmake"
-
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libx11-xcb-dev libwayland-dev libwayland-client0 unzip zip rsync
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - uses: actions/cache@v4
-        with:
-          path: android/sdk
-          key: android-sdk-v0.10.0-${{ hashFiles('android/patches/*.patch', 'tools/android_sdk.sh') }}
-
-      - name: Install patched ReXGlue SDK
-        run: |
-          chmod +x tools/android_sdk.sh
-          tools/android_sdk.sh
-
-      - name: Install Android CMake and NDK
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" "ndk;27.2.12479018"
-
-      - name: Stage assets
-        run: |
-          set -euo pipefail
-          mkdir -p android/app/src/main/assets
-          cp tools/xbox360_titles.json android/app/src/main/assets/
-          python3 -m pip install --break-system-packages --quiet pillow || python3 -m pip install --quiet pillow
-
-          if [ -f "${{ runner.temp }}/in/cover.png" ]; then
-            cp "${{ runner.temp }}/in/cover.png" android/app/src/main/assets/cover.png
-            python3 tools/android_icon.py "${{ runner.temp }}/in/cover.png" android/app/src/main/res
-          else
-            python3 tools/android_icon.py gui/rexauto_icon.png android/app/src/main/res
-          fi
-
-      - name: Create CI signing key
-        run: |
-          keytool -genkeypair \
-            -keystore android/ci-release.jks \
-            -storepass rexauto -keypass rexauto \
-            -alias rexauto -keyalg RSA -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=rexauto, O=rexauto"
-
-      - name: Build release APK
-        env:
-          REX_TITLE: ${{ needs.recompile.outputs.title }}
-          REX_TITLE_ID: ${{ needs.recompile.outputs.title_id }}
-          BASELINE_ARM: ${{ inputs.baseline_arm }}
-        run: |
-          set -euo pipefail
-          if [ "$BASELINE_ARM" = "true" ]; then
-            export REX_ANDROID_BASELINE_ARM=1
-          fi
-
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace \
-            -PrexName="$PROJECT_NAME" \
-            -PrexTitle="${REX_TITLE:-$PROJECT_NAME}" \
-            -PrexTitleId="${REX_TITLE_ID:-00000000}" \
-            -PrexPortDir="$GITHUB_WORKSPACE/autoports/$PROJECT_NAME/port" \
-            -PrexSdkDir="$GITHUB_WORKSPACE/android/sdk/rexglue-sdk" \
-            -PrexVersionCode="${GITHUB_RUN_NUMBER}" \
-            -PrexVersionName="1.${GITHUB_RUN_NUMBER}"
-
-      - name: Verify APK
-        run: |
-          set -euo pipefail
-          APK=android/app/build/outputs/apk/release/app-release.apk
-          test -f "$APK"
-          unzip -l "$APK" > /tmp/apk.txt
-
-          grep -q "lib/arm64-v8a/libmain.so" /tmp/apk.txt
-          grep -Eq "lib/arm64-v8a/librexgpu-xenos.*\.so" /tmp/apk.txt
-          grep -q "assets/xbox360_titles.json" /tmp/apk.txt
-
-          cp "$APK" "$RUNNER_TEMP/${PROJECT_NAME}-android.apk"
-          SIZE=$(stat -c%s "$APK")
-          echo "APK size: $((SIZE / 1048576)) MB" >> "$GITHUB_STEP_SUMMARY"
-          echo "Architecture: arm64-v8a" >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ needs.recompile.outputs.project_name }}-android-apk
-          path: ${{ runner.temp }}/${{ needs.recompile.outputs.project_name }}-android.apk
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Collect Android project sources
-        if: always()
-        run: |
-          set -uo pipefail
-          OUT="$RUNNER_TEMP/source-$PROJECT_NAME"
-          mkdir -p "$OUT"
-          rsync -a --exclude sdk --exclude build --exclude .gradle --exclude '*.jks' android/ "$OUT/android/"
-          if [ -d "autoports/$PROJECT_NAME/port" ]; then
-            rsync -a --exclude build "autoports/$PROJECT_NAME/port/" "$OUT/port/"
-          fi
-          cp tools/android_sdk.sh "$OUT/" || true
-          cp -r android/patches "$OUT/android/" 2>/dev/null || true
-          printf '%s\n' "$PROJECT_NAME Android project sources" > "$OUT/README.txt"
-
-      - name: Upload project sources
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-${{ needs.recompile.outputs.project_name }}
-          path: ${{ runner.temp }}/source-${{ needs.recompile.outputs.project_name }}
           retention-days: 14
