@@ -560,6 +560,14 @@ int RunAndroidApp() {
   // title renders nothing. librexgpu-xenos.so ships in the APK; the SDK
   // resolves "xenos" against nativeLibraryDir (SetAndroidApplicationContext).
   args.emplace_back("--gpu_plugin=xenos");
+  // Mobile Vulkan hardware defaults (ARM Mali, PowerVR, older Adreno): do not
+  // reject GPUs missing desktop-only features when SPIR-V compute memexport,
+  // index-buffer primitive conversion, and solid-fill fallbacks exist, and
+  // tolerate unused kInvalidVertex fetch slots common in Xbox 360 engines.
+  args.emplace_back("--vulkan_require_vertex_pipeline_stores_and_atomics=false");
+  args.emplace_back("--vulkan_require_geometry_shader=false");
+  args.emplace_back("--vulkan_require_fill_mode_non_solid=false");
+  args.emplace_back("--gpu_allow_invalid_fetch_constants=true");
   // Mobile pacing defaults (all overridable from settings.txt): the guest
   // thread scheduler must not try to pin threads to the 360's 6 hardware
   // threads (we have big.LITTLE and want the kernel to migrate freely), and
