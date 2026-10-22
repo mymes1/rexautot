@@ -1,4 +1,3 @@
-
 name: Recompile for Android
 
 on:
@@ -8,12 +7,17 @@ on:
         description: "Link direto do jogo Xbox 360"
         required: true
         type: string
-        default: "https://www.mediafire.com/file/ajxx5nbpkokn9do/Forza+Motorsport+(World)+?dkey=ypmnzsmoc0a&r=513"
+        default: "https://download2393.mediafire.com/b7kgzwaef0egozKKxpDUp9ynHoW3loUHnC7Yg5RhG7_htzTAnJY5qC1pQinMiJ0-Uo0Sd4FZu6G3MtpVxujq8IoUV4AD-NWYUJMMatrlpDGQWQDaufJguRuWCznILI_GX2nT5P6l9QOzhoewrJs_KGvkGxOXBhO4WQ80l-hXvREX/ubdhf5n6eud48u2/DBX-XEX.rar"
       name:
         description: "Nome do projeto e APK"
         required: true
         type: string
-        default: "forza_motorsport"
+        default: "db_xenoverse_recomp"
+      password:
+        description: "Password to extract archive"
+        required: false
+        type: string
+        default: "LegionGamesGod"
       baseline_arm:
         description: "Build for ARMv8.0"
         required: false
@@ -45,24 +49,32 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 350
     outputs:
+      project_name: ${{ steps.norm.outputs.project_name }}
       title: ${{ steps.meta.outputs.title }}
       title_id: ${{ steps.meta.outputs.title_id }}
     env:
       REXAUTO_WORK: ${{ github.workspace }}\autoports
       REXAUTO_PORTABLE: "1"
+      ARCHIVE_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
+      EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
 
     steps:
-      - name: Validate inputs
+      - name: Validate and normalize inputs
+        id: norm
         shell: pwsh
         env:
           GAME_URL: ${{ inputs.url }}
-          PROJECT_NAME: ${{ inputs.name }}
+          RAW_NAME: ${{ inputs.name }}
         run: |
-          if ($env:PROJECT_NAME -notmatch '^[a-z0-9_]{1,40}$') {
-            throw "Project name must use a-z, 0-9 and underscore."
-          }
+          $clean = [regex]::Replace($env:RAW_NAME.Trim().ToLowerInvariant(), '[^a-z0-9_]+', '_').Trim('_')
+          if (-not $clean) { $clean = "game" }
+          if ($clean -match '^[0-9]') { $clean = "g_$clean" }
+          if ($clean.Length -gt 40) { $clean = $clean.Substring(0, 40).TrimEnd('_') }
+          Write-Host "Normalized project name: $clean"
+          "PROJECT_NAME=$clean" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "project_name=$clean" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           if ($env:GAME_URL.Trim() -notmatch '^https?://') {
             throw "The game URL must start with http:// or https://."
           }
@@ -74,7 +86,7 @@ jobs:
           python-version: "3.12"
 
       - name: Python dependencies
-        run: python -m pip install --upgrade pip pillow
+        run: python -m pip install --upgrade pip pillow py7zr pyzipper
 
       - name: Toolchain
         shell: pwsh
@@ -85,6 +97,10 @@ jobs:
           $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
           if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found." }
           "VCVARS=$vcvars" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            "CLANG=$env:ProgramFiles\LLVM\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "CLANGXX=$env:ProgramFiles\LLVM\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
 
       - name: Resolve pinned SDK URL
         id: sdk
@@ -112,22 +128,394 @@ jobs:
       - name: Verify SDK
         run: python tools/ci_sdk.py verify
 
-      - name: Download game input
+      - name: Download and extract game input
         id: fetch
         shell: pwsh
         env:
           GAME_URL: ${{ inputs.url }}
+          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
         run: |
-          python tools/ci_fetch.py $env:GAME_URL "$env:RUNNER_TEMP\input"
+          $fetchScript = Join-Path $env:RUNNER_TEMP "fetch_and_extract.py"
+          @'
+          import base64
+          import http.cookiejar
+          import os
+          import re
+          import shutil
+          import struct
+          import subprocess
+          import sys
+          import tarfile
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          DEFAULT_PASSWORD = "LegionGamesGod"
+          BROWSER_UA = (
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+          )
+
+          def log(msg):
+              print("[fetch] " + msg, flush=True)
+
+          def candidate_passwords(pw):
+              seen = []
+              for p in (pw, DEFAULT_PASSWORD, ""):
+                  if p is not None and p not in seen:
+                      seen.append(p)
+              return seen
+
+          def gdrive_id(url):
+              u = urllib.parse.urlparse(url)
+              if "drive.google.com" not in u.netloc and "docs.google.com" not in u.netloc:
+                  return None
+              m = re.search(r"/file/d/([A-Za-z0-9_-]+)", u.path)
+              if m:
+                  return m.group(1)
+              q = urllib.parse.parse_qs(u.query)
+              return q["id"][0] if "id" in q else None
+
+          def mediafire_clean_url(url):
+              u = urllib.parse.urlparse(url)
+              host = u.netloc.lower()
+              if "mediafire.com" not in host:
+                  return None
+              m = re.search(r"/(?:file|file_premium|download)/([A-Za-z0-9]+)", u.path)
+              if m:
+                  return "https://www.mediafire.com/file/%s/" % m.group(1)
+              if host.startswith("download"):
+                  parts = [p for p in u.path.split("/") if p]
+                  if len(parts) >= 2:
+                      return "https://www.mediafire.com/file/%s/" % parts[1]
+              return None
+
+          def extract_mediafire_direct(html_bytes):
+              html = html_bytes.decode("utf-8", "ignore")
+              for m in re.finditer(r'data-scrambled-url=["\']([A-Za-z0-9+/=]+)["\']', html):
+                  try:
+                      dec = base64.b64decode(m.group(1)).decode("utf-8", "ignore").strip()
+                      if dec.startswith(("http://", "https://")):
+                          return dec
+                  except Exception:
+                      pass
+              for pat in (
+                  r'id=["\']downloadButton["\'][^>]*href=["\'](https?://[^"\']+)["\']',
+                  r'href=["\'](https?://[^"\']+)["\'][^>]*id=["\']downloadButton["\']',
+                  r'aria-label=["\']Download file["\'][^>]*href=["\'](https?://[^"\']+)["\']',
+                  r'href=["\'](https?://download[0-9a-z.-]*\.mediafire\.com/[^"\']+)["\']',
+              ):
+                  m = re.search(pat, html, re.I)
+                  if m and "javascript:" not in m.group(1).lower():
+                      return m.group(1).strip()
+              return None
+
+          def sanitize_name(name):
+              name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name or "").strip(" .")
+              return name or "download.bin"
+
+          def filename_from_resp(resp, url):
+              cd = resp.headers.get("Content-Disposition", "")
+              m = (
+                  re.search(r"filename\*=(?:UTF-8'')?\"?([^\";\r\n]+)", cd, re.I)
+                  or re.search(r'filename="?([^";\r\n]+)"?', cd, re.I)
+              )
+              if m:
+                  return sanitize_name(os.path.basename(urllib.parse.unquote(m.group(1).strip())))
+              return sanitize_name(urllib.parse.unquote(os.path.basename(urllib.parse.urlparse(url).path)))
+
+          def http_fetch(opener, url, dest_dir):
+              log("GET " + url)
+              req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+              with opener.open(req, timeout=180) as resp:
+                  final_url = resp.geturl()
+                  ctype = resp.headers.get("Content-Type", "").lower()
+                  path = os.path.join(dest_dir, filename_from_resp(resp, final_url))
+                  total = int(resp.headers.get("Content-Length") or 0)
+                  got, last = 0, -1
+                  with open(path, "wb") as f:
+                      while True:
+                          chunk = resp.read(1 << 22)
+                          if not chunk:
+                              break
+                          f.write(chunk)
+                          got += len(chunk)
+                          if total >= (8 << 20):
+                              pct = got * 100 // total
+                              if pct // 10 != last:
+                                  last = pct // 10
+                                  log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
+                  log("saved %s (%.1f MB)" % (path, got / 1e6))
+              return path, got, ctype, final_url
+
+          def looks_html(path, ctype):
+              with open(path, "rb") as f:
+                  head = f.read(4096).lstrip().lower()
+              return (
+                  "text/html" in ctype
+                  or head.startswith(b"<!doctype html")
+                  or head.startswith(b"<html")
+                  or b"<html" in head[:1024]
+              )
+
+          def download(url, dest_dir):
+              os.makedirs(dest_dir, exist_ok=True)
+              gid = gdrive_id(url)
+              if gid:
+                  log("Google Drive -> gdown (%s)" % gid)
+                  subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gdown"])
+                  import gdown
+                  out = gdown.download(id=gid, output=os.path.join(dest_dir, ""), quiet=False, fuzzy=True)
+                  if not out or not os.path.isfile(out):
+                      raise SystemExit("gdown could not fetch the file -- check link permissions")
+                  return out
+              if "dropbox.com" in url:
+                  url = re.sub(r"[?&]dl=0", lambda m: m.group(0)[0] + "dl=1", url)
+                  if "dl=1" not in url:
+                      url += ("&" if "?" in url else "?") + "dl=1"
+              if "mega.nz" in url or "mega.co.nz" in url:
+                  log("MEGA -> mega.py")
+                  subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "mega.py"])
+                  from mega import Mega
+                  return str(Mega().login().download_url(url, dest_dir))
+              if any(ch.isspace() for ch in url):
+                  raise SystemExit("URL contains spaces or line breaks. Paste the complete URL.")
+
+              jar = http.cookiejar.CookieJar()
+              opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+              path, got, ctype, final_url = http_fetch(opener, url, dest_dir)
+              if looks_html(path, ctype):
+                  with open(path, "rb") as f:
+                      html_bytes = f.read(512 * 1024)
+                  os.remove(path)
+                  direct = extract_mediafire_direct(html_bytes)
+                  if not direct:
+                      clean_mf = mediafire_clean_url(url) or mediafire_clean_url(final_url)
+                      if clean_mf and clean_mf.rstrip("/") != url.rstrip("/"):
+                          log("MediaFire token expired -> resolving %s" % clean_mf)
+                          p2, _, _, _ = http_fetch(opener, clean_mf, dest_dir)
+                          with open(p2, "rb") as f:
+                              html_bytes = f.read(512 * 1024)
+                          os.remove(p2)
+                          direct = extract_mediafire_direct(html_bytes)
+                  if direct:
+                      log("MediaFire resolved direct file URL")
+                      path, got, ctype, final_url = http_fetch(opener, direct, dest_dir)
+              if looks_html(path, ctype):
+                  os.remove(path)
+                  raise SystemExit("Link returned HTML instead of a game file. Check share permissions or use a direct link.")
+              if got == 0:
+                  raise SystemExit("Downloaded file is empty.")
+              return path
+
+          def archive_kind(path):
+              if not path or not os.path.isfile(path):
+                  return None
+              low = path.lower()
+              try:
+                  with open(path, "rb") as f:
+                      head = f.read(0x210)
+              except OSError:
+                  head = b""
+              if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+                  return "zip"
+              if head[:6] == b"7z\xbc\xaf\x27\x1c":
+                  return "7z"
+              if head[:6] == b"Rar!\x1a\x07":
+                  return "rar"
+              if head[:2] == b"\x1f\x8b" or head[:6] == b"\xfd7zXZ" or head[:3] == b"BZh" or (len(head) >= 0x106 and head[0x101:0x106] == b"ustar"):
+                  return "tar"
+              if low.endswith((".zip", ".zip.001")):
+                  return "zip"
+              if low.endswith((".7z", ".7z.001")):
+                  return "7z"
+              if low.endswith(".rar"):
+                  return "rar"
+              if low.endswith((".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2")):
+                  return "tar"
+              return None
+
+          def is_secondary_vol(fn):
+              low = fn.lower()
+              if re.search(r"\.part(?!0*1\.rar$)\d+\.rar$", low):
+                  return True
+              if re.search(r"\.[rz]\d{2,}$", low):
+                  return True
+              if re.search(r"\.\d{3}$", low) and not low.endswith(".001"):
+                  return True
+              return False
+
+          def find_7z():
+              for c in ("7z", r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe", "7zz", "7za", "7zr"):
+                  p = shutil.which(c) or (c if os.path.isfile(c) else None)
+                  if p:
+                      return p
+              return None
+
+          def unpack_one(path, out_dir, password):
+              kind = archive_kind(path) or "archive"
+              os.makedirs(out_dir, exist_ok=True)
+              pws = candidate_passwords(password)
+              errs = []
+              sz = find_7z()
+              if sz:
+                  for pw in pws:
+                      r = subprocess.run(
+                          [sz, "x", "-y", "-aoa", "-p" + pw, "-o" + out_dir, path],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace",
+                      )
+                      if r.returncode == 0:
+                          return out_dir
+                      errs.append("7z: " + (r.stdout or "").strip()[-300:])
+              if kind == "7z":
+                  import py7zr
+                  for pw in pws:
+                      try:
+                          with py7zr.SevenZipFile(path, mode="r", password=pw or None) as z:
+                              z.extractall(path=out_dir)
+                          return out_dir
+                      except Exception as ex:
+                          errs.append("py7zr: %s" % ex)
+              if kind == "zip":
+                  import pyzipper
+                  for pw in pws:
+                      try:
+                          with pyzipper.AESZipFile(path, "r") as z:
+                              z.extractall(out_dir, pwd=pw.encode("utf-8") if pw else None)
+                          return out_dir
+                      except Exception as ex:
+                          errs.append("pyzipper: %s" % ex)
+                  for pw in pws:
+                      try:
+                          with zipfile.ZipFile(path, "r") as z:
+                              z.extractall(out_dir, pwd=pw.encode("utf-8") if pw else None)
+                          return out_dir
+                      except Exception as ex:
+                          errs.append("zipfile: %s" % ex)
+              if kind == "tar":
+                  with tarfile.open(path, "r:*") as tf:
+                      tf.extractall(out_dir)
+                  return out_dir
+              raise SystemExit("Archive extraction failed (%s): %s" % (kind, "; ".join(errs)[:600]))
+
+          def is_xex(p):
+              try:
+                  with open(p, "rb") as f:
+                      return f.read(4) == b"XEX2"
+              except OSError:
+                  return False
+
+          def find_god_or_stfs(folder):
+              gods, stfs = [], []
+              for r, _, files in os.walk(folder):
+                  for fn in files:
+                      p = os.path.join(r, fn)
+                      try:
+                          if os.path.getsize(p) < 0x3B0:
+                              continue
+                          with open(p, "rb") as f:
+                              hdr = f.read(0x3B0)
+                      except OSError:
+                          continue
+                      if hdr[:4] not in (b"CON ", b"LIVE", b"PIRS"):
+                          continue
+                      if struct.unpack_from(">I", hdr, 0x3A9)[0] == 1:
+                          gods.append((0 if os.path.isdir(p + ".data") else 1, p))
+                      else:
+                          stfs.append((-os.path.getsize(p), p))
+              gods.sort()
+              stfs.sort()
+              return (gods[0][1] if gods else None), (stfs[0][1] if stfs else None)
+
+          def unpack_all(path, dest_dir, password):
+              if not archive_kind(path):
+                  return None
+              out = os.path.join(dest_dir, "unpacked")
+              log("extracting archive %s with password" % os.path.basename(path))
+              unpack_one(path, out, password)
+              try:
+                  os.remove(path)
+              except OSError:
+                  pass
+              for _ in range(3):
+                  god_hdr, stfs_pkg = find_god_or_stfs(out)
+                  if god_hdr or stfs_pkg:
+                      break
+                  has_ready, nested = False, []
+                  for r, _, files in os.walk(out):
+                      for fn in sorted(files):
+                          p = os.path.join(r, fn)
+                          fl = fn.lower()
+                          if fl == "default.xex" or fl.endswith(".iso") or is_xex(p):
+                              has_ready = True
+                          elif not is_secondary_vol(fn) and archive_kind(p):
+                              nested.append(p)
+                  if has_ready or not nested:
+                      break
+                  for i, inner in enumerate(nested):
+                      log("extracting nested archive %s" % os.path.basename(inner))
+                      unpack_one(inner, os.path.join(os.path.dirname(inner), "_inner_%d" % i), password)
+                      try:
+                          os.remove(inner)
+                      except OSError:
+                          pass
+              return out
+
+          def pick_container(root):
+              if os.path.isfile(root):
+                  if is_xex(root):
+                      folder = os.path.dirname(root)
+                      want = os.path.join(folder, "default.xex")
+                      if os.path.abspath(root) != os.path.abspath(want):
+                          shutil.move(root, want)
+                      return folder
+                  return root
+              xexes, isos, others = [], [], []
+              for r, _, files in os.walk(root):
+                  for fn in files:
+                      p = os.path.join(r, fn)
+                      fl = fn.lower()
+                      if fl == "default.xex":
+                          xexes.append(p)
+                      elif fl.endswith(".iso"):
+                          isos.append(p)
+                      elif is_xex(p) and not fl.endswith(".xexp"):
+                          others.append(p)
+              if xexes:
+                  return os.path.dirname(sorted(xexes, key=len)[0])
+              if isos:
+                  return sorted(isos, key=lambda p: -os.path.getsize(p))[0]
+              god_hdr, stfs_pkg = find_god_or_stfs(root)
+              if god_hdr:
+                  return god_hdr
+              if stfs_pkg:
+                  return stfs_pkg
+              if others:
+                  return pick_container(others[0])
+              return root
+
+          url = os.environ["GAME_URL"].strip()
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "input")
+          pw = os.environ.get("EXTRACT_PASSWORD") or DEFAULT_PASSWORD
+          got = download(url, os.path.join(dest, "dl"))
+          root = unpack_all(got, dest, pw) or got
+          container = pick_container(root)
+          log("container for rexauto: " + container)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out_f:
+              out_f.write("container=%s\n" % container)
+          '@ | Set-Content -Path $fetchScript -Encoding utf8
+
+          python $fetchScript
           if ($LASTEXITCODE -ne 0) {
-            throw "Game download failed."
+            throw "Game download or archive extraction failed."
           }
 
       - name: Recompile game
         shell: pwsh
         env:
           CONTAINER: ${{ steps.fetch.outputs.container }}
-          PROJECT_NAME: ${{ inputs.name }}
+          EXTRACT_PASSWORD: ${{ inputs.password || 'LegionGamesGod' }}
           RUNHEAL: ${{ inputs.runheal }}
           HEAL_ITERS: ${{ inputs.heal_iters }}
         run: |
@@ -142,6 +530,11 @@ jobs:
             "--heal-iters", $env:HEAL_ITERS,
             "--publish-gabarito"
           )
+
+          $helpTxt = (python rexauto.py --help 2>&1 | Out-String)
+          if ($helpTxt -match '--password') {
+            $args += @("--password", $env:EXTRACT_PASSWORD)
+          }
 
           if ($env:RUNHEAL -ne "true") {
             $args += @("--until", "build")
@@ -161,7 +554,6 @@ jobs:
         shell: pwsh
         env:
           CONTAINER: ${{ steps.fetch.outputs.container }}
-          PROJECT_NAME: ${{ inputs.name }}
         run: |
           $game = "$env:REXAUTO_WORK\$env:PROJECT_NAME\game"
           $xex = Get-ChildItem $game -Recurse -Filter default.xex -ErrorAction SilentlyContinue |
@@ -178,8 +570,6 @@ jobs:
       - name: Pack generated port
         if: success()
         shell: pwsh
-        env:
-          PROJECT_NAME: ${{ inputs.name }}
         run: |
           $port = "$env:REXAUTO_WORK\$env:PROJECT_NAME\port"
           if (-not (Test-Path "$port\generated\default\sources.cmake")) {
@@ -200,7 +590,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: port-src-${{ inputs.name }}
+          name: port-src-${{ steps.norm.outputs.project_name }}
           path: |
             ${{ runner.temp }}/port-src.zip
             ${{ runner.temp }}/cover.png
@@ -211,8 +601,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-windows-${{ inputs.name }}
-          path: ${{ env.REXAUTO_WORK }}/${{ inputs.name }}/*.log
+          name: logs-windows-${{ steps.norm.outputs.project_name }}
+          path: ${{ env.REXAUTO_WORK }}/${{ steps.norm.outputs.project_name }}/*.log
           if-no-files-found: ignore
           retention-days: 14
 
@@ -221,18 +611,18 @@ jobs:
     needs: recompile
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    env:
+      PROJECT_NAME: ${{ needs.recompile.outputs.project_name }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: port-src-${{ inputs.name }}
+          name: port-src-${{ needs.recompile.outputs.project_name }}
           path: ${{ runner.temp }}/in
 
       - name: Unpack port
-        env:
-          PROJECT_NAME: ${{ inputs.name }}
         run: |
           set -euo pipefail
           mkdir -p "autoports/$PROJECT_NAME/port"
@@ -270,7 +660,7 @@ jobs:
           set -euo pipefail
           mkdir -p android/app/src/main/assets
           cp tools/xbox360_titles.json android/app/src/main/assets/
-          python3 -m pip install --quiet pillow
+          python3 -m pip install --break-system-packages --quiet pillow || python3 -m pip install --quiet pillow
 
           if [ -f "${{ runner.temp }}/in/cover.png" ]; then
             cp "${{ runner.temp }}/in/cover.png" android/app/src/main/assets/cover.png
@@ -292,7 +682,6 @@ jobs:
         env:
           REX_TITLE: ${{ needs.recompile.outputs.title }}
           REX_TITLE_ID: ${{ needs.recompile.outputs.title_id }}
-          PROJECT_NAME: ${{ inputs.name }}
           BASELINE_ARM: ${{ inputs.baseline_arm }}
         run: |
           set -euo pipefail
@@ -312,8 +701,6 @@ jobs:
             -PrexVersionName="1.${GITHUB_RUN_NUMBER}"
 
       - name: Verify APK
-        env:
-          PROJECT_NAME: ${{ inputs.name }}
         run: |
           set -euo pipefail
           APK=android/app/build/outputs/apk/release/app-release.apk
@@ -331,15 +718,13 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.name }}-android-apk
-          path: ${{ runner.temp }}/${{ inputs.name }}-android.apk
+          name: ${{ needs.recompile.outputs.project_name }}-android-apk
+          path: ${{ runner.temp }}/${{ needs.recompile.outputs.project_name }}-android.apk
           if-no-files-found: error
           retention-days: 14
 
       - name: Collect Android project sources
         if: always()
-        env:
-          PROJECT_NAME: ${{ inputs.name }}
         run: |
           set -uo pipefail
           OUT="$RUNNER_TEMP/source-$PROJECT_NAME"
@@ -356,15 +741,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: source-${{ inputs.name }}
-          path: ${{ runner.temp }}/source-${{ inputs.name }}
+          name: source-${{ needs.recompile.outputs.project_name }}
+          path: ${{ runner.temp }}/source-${{ needs.recompile.outputs.project_name }}
           retention-days: 14
 
       - name: Upload native build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-android-${{ inputs.name }}
+          name: logs-android-${{ needs.recompile.outputs.project_name }}
           path: |
             android/app/.cxx/**/*.log
             android/app/.cxx/**/CMakeOutput.log
