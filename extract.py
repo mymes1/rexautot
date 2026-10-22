@@ -1119,7 +1119,8 @@ def pick_unpacked_container(root):
     if stfs_pkgs:
         return sorted(stfs_pkgs, key=lambda p: -os.path.getsize(p))[0]
     if others:
-        return pick_unpacked_container(others[0])
+        best_xex = sorted(others, key=lambda p: (p.count(os.sep), -os.path.getsize(p)))[0]
+        return pick_unpacked_container(best_xex)
     return root
 
 

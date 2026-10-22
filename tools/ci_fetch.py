@@ -5,7 +5,8 @@
 
 Accepts anything a phone can hand over as a link:
   * a direct URL to default.xex, an .iso, a GoD/STFS package or an archive
-  * a MediaFire share / download link (resolves via Chrome TLS + real browser fallback)
+  * a MediaFire share / download link (resolves fresh runner-IP links via Chrome TLS
+    with HTTP Range resume + real Chrome/Edge Playwright fallback)
   * a Google Drive share link (any of the usual shapes) -- via gdown
   * a Dropbox share link (dl=0 is rewritten to dl=1)
   * a Pixeldrain link (pixeldrain.com/u/<id>)
@@ -19,6 +20,7 @@ and writes it to $GITHUB_OUTPUT (container=...) when running in Actions.
 """
 import argparse
 import base64
+import html as _html
 import os
 import re
 import shutil
@@ -32,10 +34,7 @@ if ROOT not in sys.path:
 import extract as _extract  # noqa: E402
 
 DEFAULT_PASSWORD = "LegionGamesGod"
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+CONNECT_AND_STREAM_TIMEOUT = (30, 14400)  # 30s connect, 4h total transfer for multi-GB archives
 
 
 def log(msg):
@@ -54,7 +53,8 @@ def _gdrive_id(url):
 
 
 def _mediafire_candidates(url):
-    """Return candidate MediaFire share URLs with clean URLs tried before stale ?dkey= URLs."""
+    """Return candidate MediaFire URLs ordered cleanly:
+    clean runner-IP-independent share URLs FIRST, followed by the raw input URL."""
     u = urllib.parse.urlparse(url)
     host = u.netloc.lower()
     if "mediafire.com" not in host:
@@ -67,11 +67,9 @@ def _mediafire_candidates(url):
             out.append("https://www.mediafire.com/file/%s/%s/file" % (qk, slug))
         out.append("https://www.mediafire.com/file/%s/file" % qk)
     elif host.startswith("download"):
-        out.append(url)
         parts = [p for p in u.path.split("/") if p]
         if len(parts) >= 3:
             out.append("https://www.mediafire.com/file/%s/%s/file" % (parts[1], parts[2]))
-        if len(parts) >= 2:
             out.append("https://www.mediafire.com/file/%s/file" % parts[1])
     if url not in out:
         out.append(url)
@@ -82,7 +80,7 @@ def _extract_mediafire_direct_url(html_bytes):
     html = html_bytes.decode("utf-8", "ignore")
     for m in re.finditer(r'data-scrambled-url=["\']([A-Za-z0-9+/=]+)["\']', html):
         try:
-            decoded = base64.b64decode(m.group(1)).decode("utf-8", "ignore").strip()
+            decoded = _html.unescape(base64.b64decode(m.group(1)).decode("utf-8", "ignore").strip())
             if decoded.startswith(("http://", "https://")):
                 return decoded
         except Exception:
@@ -91,11 +89,13 @@ def _extract_mediafire_direct_url(html_bytes):
         r'id=["\']downloadButton["\'][^>]*href=["\'](https?://[^"\']+)["\']',
         r'href=["\'](https?://[^"\']+)["\'][^>]*id=["\']downloadButton["\']',
         r'aria-label=["\']Download file["\'][^>]*href=["\'](https?://[^"\']+)["\']',
-        r'href=["\'](https?://download[0-9a-z.-]*\.mediafire\.com/[^"\']+)["\']',
+        r'(https?://download[0-9a-z.-]*\.mediafire\.com/[^\s"\'<>\\]+)',
     ):
         m = re.search(pat, html, re.I)
-        if m and "javascript:" not in m.group(1).lower():
-            return m.group(1).strip()
+        if m:
+            found = _html.unescape(m.group(1).strip())
+            if "javascript:" not in found.lower():
+                return found
     return None
 
 
@@ -136,28 +136,99 @@ def _ensure_pkg(mod_name, pip_name=None):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name or mod_name])
 
 
+def _stream_binary_response(sess, resp, first, it, dest_dir, url_for_name, headers):
+    """Write open streaming response to disk and automatically resume via HTTP Range
+    if the server closes a multi-GB transfer early."""
+    out_path = os.path.join(dest_dir, _filename_from_headers(resp.headers, url_for_name))
+    total = int(resp.headers.get("Content-Length") or 0)
+    got, last = len(first), -1
+    try:
+        with open(out_path, "wb") as out_f:
+            out_f.write(first)
+            try:
+                for ch in it:
+                    if ch:
+                        out_f.write(ch)
+                        got += len(ch)
+                        if total >= (8 << 20):
+                            pct = got * 100 // total
+                            if pct // 10 != last:
+                                last = pct // 10
+                                log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
+            except Exception as stream_ex:
+                log("stream interrupted at %.1f MB (%s)" % (got / 1e6, stream_ex))
+    finally:
+        resp.close()
+
+    for attempt in range(1, 5):
+        if not total or got >= total:
+            break
+        log("resuming download from %.1f / %.1f MB (attempt %d/4)..." % (got / 1e6, total / 1e6, attempt))
+        rng_headers = dict(headers, Range="bytes=%d-" % got)
+        rr = sess.get(
+            url_for_name,
+            headers=rng_headers,
+            stream=True,
+            allow_redirects=True,
+            timeout=CONNECT_AND_STREAM_TIMEOUT,
+        )
+        try:
+            if rr.status_code != 206:
+                break
+            with open(out_path, "ab") as out_f:
+                for ch in rr.iter_content(chunk_size=1 << 20):
+                    if ch:
+                        out_f.write(ch)
+                        got += len(ch)
+                        if total >= (8 << 20):
+                            pct = got * 100 // total
+                            if pct // 10 != last:
+                                last = pct // 10
+                                log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
+        except Exception as rex:
+            log("resume stream note at %.1f MB: %s" % (got / 1e6, rex))
+        finally:
+            rr.close()
+
+    if total and got < total:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise RuntimeError("Incomplete download: got %d of %d bytes" % (got, total))
+
+    log("saved %s (%.1f MB)" % (out_path, got / 1e6))
+    return out_path
+
+
 def _download_curl_cffi(url, dest_dir, cookies=None, referer=None, ua=None):
     """Stream using real Chrome TLS/HTTP2 impersonation via curl_cffi."""
     _ensure_pkg("curl_cffi")
     from curl_cffi import requests as creq
 
-    headers = {
+    base_headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
         "Upgrade-Insecure-Requests": "1",
     }
     if ua:
-        headers["User-Agent"] = ua
+        base_headers["User-Agent"] = ua
     if referer:
-        headers["Referer"] = referer
+        base_headers["Referer"] = referer
 
-    with creq.Session(impersonate="chrome") as sess:
-        if cookies:
-            sess.cookies.update(cookies)
-        for cand in _mediafire_candidates(url):
+    for cand in _mediafire_candidates(url):
+        with creq.Session(impersonate="chrome") as sess:
+            if cookies:
+                sess.cookies.update(cookies)
             try:
                 log("GET (chrome-tls) " + cand)
-                resp = sess.get(cand, headers=headers, stream=True, allow_redirects=True, timeout=180)
+                resp = sess.get(
+                    cand,
+                    headers=base_headers,
+                    stream=True,
+                    allow_redirects=True,
+                    timeout=CONNECT_AND_STREAM_TIMEOUT,
+                )
                 if resp.status_code >= 400:
                     log("HTTP %d on %s" % (resp.status_code, cand))
                     resp.close()
@@ -186,15 +257,17 @@ def _download_curl_cffi(url, dest_dir, cookies=None, referer=None, ua=None):
                     direct = _extract_mediafire_direct_url(bytes(buf))
                     if direct:
                         log("resolved direct download link via Chrome TLS")
+                        dl_headers = dict(base_headers, Referer=final_u)
                         r2 = sess.get(
                             direct,
-                            headers=dict(headers, Referer=final_u),
+                            headers=dl_headers,
                             stream=True,
                             allow_redirects=True,
-                            timeout=300,
+                            timeout=CONNECT_AND_STREAM_TIMEOUT,
                         )
                         if r2.status_code < 400:
                             ct2 = r2.headers.get("Content-Type", "")
+                            u2 = str(r2.url)
                             it2 = r2.iter_content(chunk_size=1 << 20)
                             f2 = b""
                             for ch in it2:
@@ -202,43 +275,11 @@ def _download_curl_cffi(url, dest_dir, cookies=None, referer=None, ua=None):
                                     f2 = ch
                                     break
                             if f2 and not _is_html_head(f2, ct2):
-                                out_path = os.path.join(dest_dir, _filename_from_headers(r2.headers, str(r2.url)))
-                                total = int(r2.headers.get("Content-Length") or 0)
-                                got, last = len(f2), -1
-                                with open(out_path, "wb") as out_f:
-                                    out_f.write(f2)
-                                    for ch in it2:
-                                        if ch:
-                                            out_f.write(ch)
-                                            got += len(ch)
-                                            if total >= (8 << 20):
-                                                pct = got * 100 // total
-                                                if pct // 10 != last:
-                                                    last = pct // 10
-                                                    log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
-                                r2.close()
-                                log("saved %s (%.1f MB)" % (out_path, got / 1e6))
-                                return out_path
+                                return _stream_binary_response(sess, r2, f2, it2, dest_dir, u2, dl_headers)
                         r2.close()
                     continue
 
-                out_path = os.path.join(dest_dir, _filename_from_headers(resp.headers, final_u))
-                total = int(resp.headers.get("Content-Length") or 0)
-                got, last = len(first), -1
-                with open(out_path, "wb") as out_f:
-                    out_f.write(first)
-                    for chunk in it:
-                        if chunk:
-                            out_f.write(chunk)
-                            got += len(chunk)
-                            if total >= (8 << 20):
-                                pct = got * 100 // total
-                                if pct // 10 != last:
-                                    last = pct // 10
-                                    log("  %d%% (%.1f / %.1f MB)" % (pct, got / 1e6, total / 1e6))
-                resp.close()
-                log("saved %s (%.1f MB)" % (out_path, got / 1e6))
-                return out_path
+                return _stream_binary_response(sess, resp, first, it, dest_dir, final_u, base_headers)
             except Exception as ex:
                 log("chrome-tls attempt note (%s): %s" % (cand, ex))
     return None
@@ -252,15 +293,22 @@ def _download_real_browser(url, dest_dir):
     from playwright.sync_api import sync_playwright
 
     target_urls = _mediafire_candidates(url)
+    launch_flags = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--window-size=1280,800",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--no-sandbox",
+    ]
     with sync_playwright() as p:
         browser = None
         for channel in ("chrome", "msedge", None):
             for headless in (False, True):
                 try:
-                    kw = {
-                        "headless": headless,
-                        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-                    }
+                    kw = {"headless": headless, "args": launch_flags}
                     if channel:
                         kw["channel"] = channel
                     browser = p.chromium.launch(**kw)
@@ -272,17 +320,23 @@ def _download_real_browser(url, dest_dir):
                 break
         if not browser:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            browser = p.chromium.launch(headless=True, args=launch_flags)
 
         last_info = ""
         try:
             ctx = browser.new_context(accept_downloads=True, viewport={"width": 1280, "height": 800})
             ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            captured = []
+
+            def _watch_page(pg):
+                pg.on("download", lambda dl: captured.append(dl))
+
+            ctx.on("page", _watch_page)
             page = ctx.new_page()
+            _watch_page(page)
 
             for cand in target_urls:
-                captured = []
-                page.on("download", lambda dl, bucket=captured: bucket.append(dl))
+                captured.clear()
                 log("opening in browser: " + cand)
                 try:
                     page.goto(cand, wait_until="domcontentloaded", timeout=90000)
