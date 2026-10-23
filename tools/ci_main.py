@@ -33,11 +33,36 @@ def write_gh(env_var, key, val):
             f.write("%s=%s\n" % (key, val))
 
 
-def run_cmd(cmd, cwd=None, env=None):
+def run_cmd(cmd, cwd=None, env=None, log_path=None):
     log("exec: " + " ".join(str(c) for c in cmd))
-    res = subprocess.run(cmd, cwd=cwd or ROOT, env=env)
-    if res.returncode != 0:
-        raise SystemExit("Command failed (exit %d): %s" % (res.returncode, " ".join(str(c) for c in cmd)))
+    if not log_path:
+        res = subprocess.run(cmd, cwd=cwd or ROOT, env=env)
+        if res.returncode != 0:
+            raise SystemExit("Command failed (exit %d): %s" % (res.returncode, " ".join(str(c) for c in cmd)))
+        return
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
+        lf.write("$ %s\n" % " ".join(str(c) for c in cmd))
+        lf.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd or ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            lf.write(line)
+            lf.flush()
+        rc = proc.wait()
+    if rc != 0:
+        raise SystemExit("Command failed (exit %d): %s" % (rc, " ".join(str(c) for c in cmd)))
 
 
 def normalize_project_name(raw):
@@ -304,19 +329,27 @@ def cmd_build_apk():
 
     gradlew = os.path.join(ROOT, "android", "gradlew")
     os.chmod(gradlew, 0o755)
+    gradle_props = [
+        "-PrexName=" + project,
+        "-PrexTitle=" + title,
+        "-PrexTitleId=" + title_id,
+        "-PrexPortDir=" + port_dir,
+        "-PrexSdkDir=" + os.path.join(ROOT, "android", "sdk", "rexglue-sdk"),
+        "-PrexVersionCode=" + run_no,
+        "-PrexVersionName=1." + run_no,
+    ]
+    gradle_log = os.path.join(ROOT, "android", "app", ".cxx", "gradle_build.log")
     run_cmd(
-        [
-            gradlew, "assembleRelease", "--no-daemon", "--stacktrace",
-            "-PrexName=" + project,
-            "-PrexTitle=" + title,
-            "-PrexTitleId=" + title_id,
-            "-PrexPortDir=" + port_dir,
-            "-PrexSdkDir=" + os.path.join(ROOT, "android", "sdk", "rexglue-sdk"),
-            "-PrexVersionCode=" + run_no,
-            "-PrexVersionName=1." + run_no,
-        ],
+        [gradlew, ":app:compileReleaseJavaWithJavac", "--no-daemon", "--stacktrace"] + gradle_props,
         cwd=os.path.join(ROOT, "android"),
         env=env,
+        log_path=gradle_log,
+    )
+    run_cmd(
+        [gradlew, "assembleRelease", "--no-daemon", "--stacktrace"] + gradle_props,
+        cwd=os.path.join(ROOT, "android"),
+        env=env,
+        log_path=gradle_log,
     )
 
     apk_path = os.path.join(ROOT, "android", "app", "build", "outputs", "apk", "release", "app-release.apk")

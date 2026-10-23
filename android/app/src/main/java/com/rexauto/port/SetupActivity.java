@@ -257,9 +257,9 @@ public class SetupActivity extends Activity {
             if (!ready) {
                 status.setText(getString(R.string.status_idle));
             } else {
-                File root = GameFiles.configuredGameRoot(this);
+                String root = GameFiles.configuredGameRoot(this);
                 long[] stats = {0, 0};
-                countTree(root, stats);
+                countTree(root != null ? new File(root) : null, stats);
                 if (stats[0] <= 1 && stats[1] < (64L << 20)) {
                     status.setText(String.format(Locale.US,
                             "%s\n⚠ Only default.xex found (%d MB, no data/.cpk archives). For extracted folders, tap 'Pick extracted folder' and choose the folder containing default.xex!",
