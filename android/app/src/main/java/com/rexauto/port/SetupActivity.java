@@ -238,13 +238,37 @@ public class SetupActivity extends Activity {
         }
     }
 
+    private static void countTree(File f, long[] stats) {
+        if (f == null || !f.exists()) return;
+        if (f.isFile()) {
+            stats[0]++;
+            stats[1] += f.length();
+            return;
+        }
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) countTree(k, stats);
+    }
+
     private void refresh() {
         boolean ready = GameFiles.hasValidGameRoot(this);
         playBtn.setVisibility(ready ? View.VISIBLE : View.GONE);
         gfxBtn.setVisibility(View.VISIBLE);
         if (!busy) {
-            status.setText(ready ? getString(R.string.status_ready, GameFiles.configuredGameRoot(this))
-                                 : getString(R.string.status_idle));
+            if (!ready) {
+                status.setText(getString(R.string.status_idle));
+            } else {
+                File root = GameFiles.configuredGameRoot(this);
+                long[] stats = {0, 0};
+                countTree(root, stats);
+                if (stats[0] <= 1 && stats[1] < (64L << 20)) {
+                    status.setText(String.format(Locale.US,
+                            "%s\n⚠ Only default.xex found (%d MB, no data/.cpk archives). For extracted folders, tap 'Pick extracted folder' and choose the folder containing default.xex!",
+                            getString(R.string.status_ready, root), stats[1] >> 20));
+                } else {
+                    status.setText(String.format(Locale.US, "%s (%d files, %d MB)",
+                            getString(R.string.status_ready, root), stats[0], stats[1] >> 20));
+                }
+            }
         }
     }
 

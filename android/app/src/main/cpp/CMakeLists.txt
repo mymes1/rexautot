@@ -19,6 +19,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Android 15+ 16 KB page-size ELF segment alignment across all shared libraries.
+add_link_options(-Wl,-z,max-page-size=16384)
 
 set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
 set(REXGLUE_BUILD_TESTS OFF CACHE BOOL "" FORCE)

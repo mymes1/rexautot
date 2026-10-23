@@ -21,8 +21,8 @@ public class MainActivity extends SDLActivity {
             finish();
             return;
         }
-        super.onCreate(savedInstanceState);
         applyOrientation();
+        super.onCreate(savedInstanceState);
         // Ask the OS for the sustained (thermally stable) clock profile instead of
         // the burst-then-throttle default, and never dim while playing.
         android.view.Window w = getWindow();

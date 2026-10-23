@@ -100,10 +100,11 @@ public final class GraphicsSettings {
             m.put("texture_cache_memory_limit_soft", "192");
             m.put("texture_cache_memory_limit_hard", "384");
             m.put("texture_cache_memory_limit_render_to_texture", "16");
-            // shader compile off the render thread; skip presenting frames the
-            // GPU could not finish in time instead of queueing them up
-            m.put("async_shader_compilation", "true");
-            m.put("vulkan_async_skip_incomplete_frames", "true");
+            // execute all draws faithfully (one-shot RTT passes such as YEBIS 2
+            // tone-map LUT bakes and character portraits must not run against a
+            // blank placeholder shader, and frames must never be skipped at present)
+            m.put("async_shader_compilation", "false");
+            m.put("vulkan_async_skip_incomplete_frames", "false");
             // present: FIFO only (mailbox/immediate keep the GPU busy rendering
             // frames the panel never shows -- pure heat on a phone)
             m.put("vulkan_allow_present_mode_immediate", "false");

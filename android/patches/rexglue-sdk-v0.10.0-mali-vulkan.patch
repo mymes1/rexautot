@@ -83,8 +83,126 @@ index c2c4fd4..15ee6f4 100644
  
    static inline void InitHostExceptions(u32& csr) noexcept {
      csr &= ~ExceptionMask;  // Clear enable bits to disable exceptions
+diff --git a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+index 9d0d507..bd07985 100644
+--- a/include/rex/ui/surface_android.h
++++ b/include/rex/ui/surface_android.h
+@@ -21,7 +21,16 @@ namespace ui {
+ 
+ class AndroidNativeWindowSurface final : public Surface {
+  public:
+-  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {
++    if (window_) {
++      ANativeWindow_acquire(window_);
++    }
++  }
++  ~AndroidNativeWindowSurface() override {
++    if (window_) {
++      ANativeWindow_release(window_);
++    }
++  }
+   TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
+   ANativeWindow* window() const { return window_; }
+ 
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 71e7473..94e1ff2 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -42,6 +42,9 @@ class WindowSDL final : public Window {
+   void HandleMouseEvent(SDL_Event& event);
+   void HandleDropEvent(SDL_Event& event);
+   void HandlePaintEvent();
++#if REX_PLATFORM_ANDROID
++  void SyncAndroidNativeWindow();
++#endif
+ 
+  protected:
+   uint32_t GetLatestDpiImpl() const override;
+@@ -84,6 +87,9 @@ class WindowSDL final : public Window {
+   std::atomic<bool> paint_pending_{false};
+   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
+   SDL_TimerID cursor_hide_timer_ = 0;
++#if REX_PLATFORM_ANDROID
++  void* last_android_native_window_ = nullptr;
++#endif
+ };
+ 
+ }  // namespace rex::ui
+diff --git a/include/rex/ui/windowed_app_context_sdl.h b/include/rex/ui/windowed_app_context_sdl.h
+index 23737b3..53e62da 100644
+--- a/include/rex/ui/windowed_app_context_sdl.h
++++ b/include/rex/ui/windowed_app_context_sdl.h
+@@ -52,6 +52,9 @@ class SDLWindowedAppContext final : public WindowedAppContext {
+ 
+   void ProcessEvent(SDL_Event& event);
+   void ProcessQuitRequest();
++#if REX_PLATFORM_ANDROID
++  void SyncAndroidNativeWindows();
++#endif
+   static bool SDLCALL WatchEvent(void* userdata, SDL_Event* event);
+ 
+   std::unordered_map<SDL_WindowID, WindowSDL*> windows_;
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index 723b97d..a4033d8 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -296,13 +296,15 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
+     FileInfo info;
+ 
+     info.name = ent->d_name;
+-    struct stat st;
+-    stat((path / info.name).c_str(), &st);
++    struct stat st = {};
++    if (stat((path / info.name).c_str(), &st) != 0) {
++      continue;
++    }
+     info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
+     info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
+     info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
+     info.path = path;
+-    if (ent->d_type == DT_DIR) {
++    if (ent->d_type == DT_DIR || S_ISDIR(st.st_mode)) {
+       info.type = FileInfo::Type::kDirectory;
+       info.total_size = 0;
+     } else {
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+index a1b4dad..01f2223 100644
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -107,6 +107,13 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
+ 
+   // Resolve relative paths
+   auto normalized_path(rex::string::utf8_canonicalize_guest_path(path));
++  // Many Xbox 360 titles (e.g. Dragon Ball Xenoverse) open files relative to
++  // the title root without a device prefix ("data\\msg\\system_message_en.msg",
++  // "data\\system\\save\\save_thumbnail.png"). Default unprefixed paths to game:\.
++  if (!normalized_path.empty() && normalized_path[0] != '\\' &&
++      normalized_path.find(':') == std::string::npos) {
++    normalized_path = "game:\\" + normalized_path;
++  }
+ 
+   // Resolve symlinks.
+   std::string resolved_path;
+@@ -154,8 +161,15 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
+ }
+ 
+ Entry* VirtualFileSystem::CreatePath(const std::string_view path, uint32_t attributes) {
++  std::string prefixed_storage;
++  std::string_view effective_path = path;
++  if (!effective_path.empty() && effective_path[0] != '\\' && effective_path[0] != '/' &&
++      effective_path.find(':') == std::string_view::npos) {
++    prefixed_storage = "game:\\" + std::string(effective_path);
++    effective_path = prefixed_storage;
++  }
+   // Create all required directories recursively.
+-  auto path_parts = rex::string::utf8_split_path(path);
++  auto path_parts = rex::string::utf8_split_path(effective_path);
+   if (path_parts.empty()) {
+     return nullptr;
+   }
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 0b45c0d..3c0dc31 100644
+index 0b45c0d..08f0688 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -931,10 +931,16 @@ bool VulkanCommandProcessor::SetupContext() {
@@ -108,7 +226,21 @@ index 0b45c0d..3c0dc31 100644
    }
    if (!device_properties.geometryShader) {
      if (REXCVAR_GET(vulkan_require_geometry_shader)) {
-@@ -3631,13 +3637,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -2396,6 +2402,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           frontbuffer_width_scaled, frontbuffer_height_scaled);
+     }
+   }
++  static bool first_guest_frame_logged = false;
++  if (!first_guest_frame_logged) {
++    first_guest_frame_logged = true;
++    REXGPU_WARN(
++        "VulkanCommandProcessor: Presenting first guest frame ({}x{}, format={})",
++        guest_output_width, guest_output_height, static_cast<uint32_t>(frontbuffer_format));
++  }
+   REXGPU_DEBUG(
+       "XELOG_GPU PRESENT: swap_texture_view={:p} packet_size={}x{} src_size={}x{} "
+       "src_unscaled={}x{} guest_output_size={}x{} format={}",
+@@ -3631,13 +3644,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
    bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
@@ -124,7 +256,7 @@ index 0b45c0d..3c0dc31 100644
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
  
-@@ -3693,8 +3695,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3693,8 +3702,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    PrimitiveProcessor::ProcessingResult primitive_processing_result;
    SpirvShaderTranslator::Modification vertex_shader_modification;
    SpirvShaderTranslator::Modification pixel_shader_modification;
@@ -136,7 +268,7 @@ index 0b45c0d..3c0dc31 100644
    bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
  
    // Two iterations because a submission (even the current one - in which case
-@@ -3758,6 +3761,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3758,6 +3768,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
                                                    pixel_shader_translation)) {
        return draw_fail("shader_translation");
      }
@@ -153,7 +285,7 @@ index 0b45c0d..3c0dc31 100644
  
      // Obtain the samplers. Note that the bindings don't depend on the shader
      // modification, so if on the second iteration of this loop it becomes
-@@ -3838,47 +3851,66 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3838,47 +3858,66 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
    texture_cache_->RequestTextures(used_texture_mask);
  
@@ -256,7 +388,7 @@ index 0b45c0d..3c0dc31 100644
    if (current_guest_graphics_pipeline_layout_ != pipeline_layout) {
      if (current_guest_graphics_pipeline_layout_) {
        // Keep descriptor set layouts for which the new pipeline layout is
-@@ -3895,6 +3927,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3895,6 +3934,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          descriptor_sets_kept = std::min(
              descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
        }
@@ -264,7 +396,7 @@ index 0b45c0d..3c0dc31 100644
      } else {
        // No or unknown pipeline layout previously bound - all bindings are in an
        // indeterminate state.
-@@ -3967,10 +4000,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3967,10 +4007,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
    }
  
@@ -294,7 +426,7 @@ index 0b45c0d..3c0dc31 100644
  
    // Update uniform buffers and descriptor sets after binding the pipeline with
    // the new layout.
-@@ -4126,50 +4176,91 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4126,50 +4183,91 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
    }
  
@@ -429,7 +561,7 @@ index 0b45c0d..3c0dc31 100644
    }
  
    // Invalidate textures in memexported memory and watch for changes.
-@@ -5953,10 +6044,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+@@ -5953,10 +6051,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
    }
    if (primitive_processing_result.index_buffer_type ==
            PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA ||
@@ -490,6 +622,26 @@ index 91ac08f..cded007 100644
  bool VulkanPipelineCache::ConfigurePipeline(
      VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 51ddbb4..88ac58f 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -683,6 +683,15 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+   parameters.clamp_x = NormalizeClampMode(fetch_clamp_x);
+   parameters.clamp_y = NormalizeClampMode(fetch_clamp_y);
+   parameters.clamp_z = NormalizeClampMode(fetch_clamp_z);
++  const TextureBinding* streaming_binding = GetValidTextureBinding(binding.fetch_constant);
++  if (streaming_binding && !streaming_binding->key.tiled &&
++      (streaming_binding->key.format == xenos::TextureFormat::k_8 ||
++       streaming_binding->key.format == xenos::TextureFormat::k_8_8)) {
++    parameters.clamp_x = xenos::ClampMode::kClampToEdge;
++    parameters.clamp_y = xenos::ClampMode::kClampToEdge;
++    parameters.clamp_z = xenos::ClampMode::kClampToEdge;
++    parameters.border_color = xenos::BorderColor::k_ABGR_Black;
++  }
+   if (xenos::ClampModeUsesBorder(parameters.clamp_x) ||
+       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
+       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
 diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
 index 8197bb4..fd6f1ca 100644
 --- a/src/ui/vulkan/vulkan_device.cpp
@@ -545,3 +697,165 @@ index 8197bb4..fd6f1ca 100644
      }
      if (REXCVAR_GET(vulkan_require_geometry_shader) && !supported_features.geometryShader) {
        REXLOG_WARN(
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..0535374 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1232,7 +1232,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+ #endif
+   VkSurfaceFormatKHR image_format;
+   if (surface_formats.empty() ||
+-      (surface_formats.size() == 1 || surface_formats[0].format == VK_FORMAT_UNDEFINED)) {
++      (surface_formats.size() == 1 && surface_formats[0].format == VK_FORMAT_UNDEFINED)) {
+     // Can choose any format if the implementation specifies only UNDEFINED.
+     image_format.format = kFormat8888Primary;
+     image_format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+@@ -1410,7 +1410,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
+     return VK_NULL_HANDLE;
+   }
+-  REXLOG_INFO(
++  REXLOG_WARN(
+       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
+       "{}, presentation mode {}",
+       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
+@@ -1584,11 +1584,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     case VK_ERROR_OUT_OF_DATE_KHR:
+     case VK_ERROR_SURFACE_LOST_KHR:
+     case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+-      // Not an error, reporting just as info (may normally occur while resizing
+-      // on some platforms).
+-      REXLOG_INFO(
+-          "VulkanPresenter: Presentation to the swapchain image has been "
+-          "dropped as the swapchain or the surface has become outdated");
++      REXLOG_WARN(
++          "VulkanPresenter: Acquire swapchain image dropped (result={}), "
++          "swapchain or surface outdated",
++          int32_t(acquire_result));
+       return PaintResult::kNotPresentedConnectionOutdated;
+     default:
+       REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
+@@ -2255,13 +2254,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     case VK_ERROR_OUT_OF_DATE_KHR:
+     case VK_ERROR_SURFACE_LOST_KHR:
+     case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+-      // Not an error, reporting just as info (may normally occur while resizing
+-      // on some platforms).
+-      REXLOG_INFO(
+-          "VulkanPresenter: Presentation to the swapchain image has been "
+-          "dropped as the swapchain or the surface has become outdated");
+-      // Note that the semaphore wait (followed by reset) has been enqueued,
+-      // however, this should have no effect on anything here likely.
++      REXLOG_WARN(
++          "VulkanPresenter: Present swapchain image dropped (result={}), "
++          "swapchain or surface outdated",
++          int32_t(present_result));
+       return PaintResult::kNotPresentedConnectionOutdated;
+     default:
+       REXLOG_ERROR("VulkanPresenter: Failed to present the swapchain image");
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index b5174ff..47b8c81 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -413,6 +413,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+     // SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER ("SDL.window.android.window").
+     auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
+         props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    last_android_native_window_ = native_window;
+     if (native_window) {
+       return std::make_unique<AndroidNativeWindowSurface>(native_window);
+     }
+@@ -455,10 +456,47 @@ void WindowSDL::RequestPaintImpl() {
+ 
+ void WindowSDL::HandlePaintEvent() {
+   paint_pending_.store(false, std::memory_order_release);
++#if REX_PLATFORM_ANDROID
++  SyncAndroidNativeWindow();
++#endif
+   OnPaint();
+ }
+ 
++#if REX_PLATFORM_ANDROID
++void WindowSDL::SyncAndroidNativeWindow() {
++  if (!sdl_window_) {
++    return;
++  }
++  SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
++  void* current_window =
++      SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
++  if (current_window == last_android_native_window_) {
++    return;
++  }
++  void* previous_window = last_android_native_window_;
++  last_android_native_window_ = current_window;
++  REXLOG_WARN("WindowSDL: Android native window changed ({:p} -> {:p}), recreating surface",
++              previous_window, current_window);
++  if (current_window) {
++    int pixel_width = 0;
++    int pixel_height = 0;
++    SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height);
++    if (pixel_width > 0 && pixel_height > 0) {
++      WindowDestructionReceiver destruction_receiver(this);
++      OnActualSizeUpdate(uint32_t(pixel_width), uint32_t(pixel_height), destruction_receiver);
++      if (destruction_receiver.IsWindowDestroyed()) {
++        return;
++      }
++    }
++  }
++  OnSurfaceChanged(current_window != nullptr);
++}
++#endif
++
+ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
++#if REX_PLATFORM_ANDROID
++  SyncAndroidNativeWindow();
++#endif
+   WindowDestructionReceiver destruction_receiver(this);
+   switch (event.type) {
+     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..f3a30e6 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -87,15 +87,41 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
+ int SDLWindowedAppContext::RunMainMessageLoop() {
+   while (!HasQuitFromUIThread()) {
+     SDL_Event event;
++#if REX_PLATFORM_ANDROID
++    if (SDL_WaitEventTimeout(&event, 50)) {
++      do {
++        ProcessEvent(event);
++      } while (!HasQuitFromUIThread() && SDL_PollEvent(&event));
++    }
++    if (!HasQuitFromUIThread()) {
++      SyncAndroidNativeWindows();
++    }
++#else
+     if (!SDL_WaitEvent(&event)) {
+       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
+       return EXIT_FAILURE;
+     }
+     ProcessEvent(event);
++#endif
+   }
+   return EXIT_SUCCESS;
+ }
+ 
++#if REX_PLATFORM_ANDROID
++void SDLWindowedAppContext::SyncAndroidNativeWindows() {
++  std::vector<SDL_WindowID> window_ids;
++  window_ids.reserve(windows_.size());
++  for (const auto& [id, window] : windows_) {
++    window_ids.push_back(id);
++  }
++  for (SDL_WindowID id : window_ids) {
++    if (WindowSDL* window = GetWindow(id)) {
++      window->SyncAndroidNativeWindow();
++    }
++  }
++}
++#endif
++
+ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+   if (event.type == wakeup_event_type_) {
+     ExecutePendingFunctionsFromUIThread();

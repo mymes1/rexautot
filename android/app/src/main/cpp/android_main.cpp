@@ -522,6 +522,11 @@ int RunAndroidApp() {
   std::error_code ec;
   std::filesystem::create_directories(external_dir + "/data", ec);
   const std::string log_dir = ResolveLogDir(external_dir);
+  const std::string log_file_path = fmt::format("{}/{}.log", log_dir, kAppIdentifier);
+  // Rotate previous run's log so each launch starts cleanly without mixing
+  // diagnostics from earlier runs.
+  std::filesystem::remove(log_dir + "/" + kAppIdentifier + ".prev.log", ec);
+  std::filesystem::rename(log_file_path, log_dir + "/" + kAppIdentifier + ".prev.log", ec);
   // A previous crash.txt is consumed by the launcher; a fresh launch means the
   // user has seen it (or chose to play again) -- start clean.
   std::filesystem::remove(log_dir + "/crash.txt", ec);
@@ -540,6 +545,7 @@ int RunAndroidApp() {
   setenv("REX_NO_PORTABLE_USERDATA", "1", 1);
   unsetenv("REX_PORTABLE_ONLY");
 
+  std::filesystem::create_directories(external_dir + "/data/cache", ec);
   std::vector<std::string> args;
   args.emplace_back(kAppIdentifier);
   if (!game_root.empty()) {
@@ -548,7 +554,8 @@ int RunAndroidApp() {
     ALOGE("no game_root.txt under %s - re-run setup", external_dir.c_str());
   }
   args.emplace_back(fmt::format("--user_data_root={}", external_dir + "/data"));
-  args.emplace_back(fmt::format("--log_file={}/{}.log", log_dir, kAppIdentifier));
+  args.emplace_back(fmt::format("--cache_root={}", external_dir + "/data/cache"));
+  args.emplace_back(fmt::format("--log_file={}", log_file_path));
   // Mobile defaults (see hells-gate-recomp-android docs/android_performance):
   // no per-frame full re-upload of guest memory pages; the write-watch keeps
   // coherency. Everything below can be overridden by settings.txt.
