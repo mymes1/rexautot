@@ -11,7 +11,10 @@
     <string name="status_done">Game installed</string>
     <string name="play">▶  Play</string>
     <string name="pick_iso">Choose ISO / XBLA package / default.xex</string>
-    <string name="pick_folder">Choose folder (extracted game or Games on Demand)</string>
+    <string name="pick_link_folder">Link extracted folder directly (instant, no copy)</string>
+    <string name="pick_folder">Choose folder (copy extracted game or Games on Demand)</string>
+    <string name="perm_all_files_title">Direct folder access (no 7 GB copy)</string>
+    <string name="perm_all_files_msg">Allow \"All files access\" on the next screen, then press Back to pick your extracted game folder and launch immediately without copying gigabytes of files.</string>
     <string name="graphics">Graphics &amp; performance</string>
     <string name="logs">Logs &amp; crash report</string>
     <string name="crash_title">The game crashed last time</string>

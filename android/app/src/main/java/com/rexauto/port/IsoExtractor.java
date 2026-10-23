@@ -173,12 +173,44 @@ public final class IsoExtractor {
 
     /** Plain stream copy used for a picked default.xex / loose files. */
     public static void copyStream(InputStream in, File dest) throws IOException {
+        copyStream(in, dest, null, null, 0L, 0L);
+    }
+
+    /** Atomic stream copy (.part -> rename) with throttled progress updates. */
+    public static long copyStream(InputStream in, File dest, Progress progress, String label, long baseDone, long totalBytes) throws IOException {
+        if (in == null) throw new IOException("Cannot read input stream for " + dest.getName());
         File parent = dest.getParentFile();
-        if (parent != null) parent.mkdirs();
-        try (OutputStream out = new FileOutputStream(dest)) {
+        if (parent != null && !parent.isDirectory()) parent.mkdirs();
+        File tmp = new File(parent, dest.getName() + ".part");
+        long written = 0, lastReport = 0;
+        try (OutputStream out = new FileOutputStream(tmp)) {
             byte[] buf = new byte[1 << 20];
             int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                written += n;
+                if (progress != null && written - lastReport >= (2L << 20)) {
+                    lastReport = written;
+                    progress.onProgress(label != null ? label : dest.getName(), baseDone + written, totalBytes);
+                }
+            }
+            out.flush();
+        } catch (IOException e) {
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+            throw e;
         }
+        if (dest.exists() && !dest.delete()) {
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+            throw new IOException("Cannot replace existing file " + dest.getName());
+        }
+        if (!tmp.renameTo(dest)) {
+            throw new IOException("Cannot finalize copied file " + dest.getName());
+        }
+        if (progress != null) {
+            progress.onProgress(label != null ? label : dest.getName(), baseDone + written, totalBytes);
+        }
+        return written;
     }
 }

@@ -321,6 +321,18 @@ public final class StfsExtractor {
         public int volumeType() { return StfsExtractor.volumeType(hdr); }
     }
 
+    /** Returns true if an STFS package actually contains a default.xex entry. */
+    public static boolean hasDefaultXex(FileChannel ch, ByteBuffer hdr) {
+        try {
+            List<Stfs.Entry> entries = new Stfs(ch, hdr).fileTable();
+            for (Stfs.Entry e : entries) {
+                if (!e.directory && e.name != null && e.name.equalsIgnoreCase("default.xex")) return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
     /**
      * Walk a picked document tree (depth-bounded) looking for a package header,
      * preferring an SVOD header with its '.data' folder beside it (a GoD dump).
@@ -348,15 +360,20 @@ public final class StfsExtractor {
             if (size > 0 && size < 0x3B0) continue;
             Uri doc = DocumentsContract.buildDocumentUriUsingTree(tree, r[0]);
             ByteBuffer hdr;
+            boolean stfsHasXex = false;
             try (ParcelFileDescriptor pfd = cr.openFileDescriptor(doc, "r")) {
                 if (pfd == null) continue;
                 try (FileChannel ch = new FileInputStream(pfd.getFileDescriptor()).getChannel()) {
                     hdr = readHeader(ch);
+                    if (hdr != null && volumeType(hdr) != VOLUME_SVOD) {
+                        stfsHasXex = hasDefaultXex(ch, hdr);
+                    }
                 }
             } catch (Exception e) {
                 continue;
             }
             if (hdr == null) continue;
+            if (volumeType(hdr) != VOLUME_SVOD && !stfsHasXex) continue;
             String dataDirId = dirs.get(r[1] + ".data");
             Uri dataDir = dataDirId == null ? null : DocumentsContract.buildDocumentUriUsingTree(tree, dataDirId);
             Found f = new Found(doc, r[1], hdr, dataDir);
@@ -364,7 +381,8 @@ public final class StfsExtractor {
             if (best == null) best = f;
         }
         for (String[] r : rows) {
-            if (!DocumentsContract.Document.MIME_TYPE_DIR.equals(r[2]) || (r[1] != null && r[1].endsWith(".data"))) continue;
+            if (!DocumentsContract.Document.MIME_TYPE_DIR.equals(r[2])
+                    || (r[1] != null && (r[1].endsWith(".data") || r[1].equalsIgnoreCase("$SystemUpdate")))) continue;
             Found f = findInTree(cr, tree, r[0], depth + 1);
             if (f != null && (f.volumeType() == VOLUME_SVOD && f.dataDirDoc != null)) return f;
             if (best == null) best = f;
