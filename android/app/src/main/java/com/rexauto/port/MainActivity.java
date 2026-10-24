@@ -35,25 +35,37 @@ public class MainActivity extends SDLActivity {
         }
         if (PadSettings.get(this).enabled()) {
             installGamepad();
-            if (mGamepad == null) {
-                // Some Samsung builds inflate SDL's view hierarchy a frame later
-                // than the activity; retry once the decor view has laid out so
-                // the touch controls can never silently go missing.
-                getWindow().getDecorView().post(this::installGamepad);
-            }
+            // Some Samsung builds inflate SDL's view hierarchy a frame later
+            // than the activity; retry once the decor view has laid out so the
+            // touch controls can never silently go missing.
+            getWindow().getDecorView().post(this::installGamepad);
         }
     }
 
+    /**
+     * Idempotent: creates the overlay once, and afterwards only re-attaches the
+     * same instance if SDL rebuilt its layout. A detached overlay still draws
+     * nothing but also receives nothing, so this has to run after every resume
+     * and after surface re-creation, not just once.
+     */
     private void installGamepad() {
-        if (mGamepad != null) return;
-        mGamepad = VirtualPadView.install(this);
-        if (mGamepad != null) mGamepad.bringToFront();
+        mGamepad = VirtualPadView.install(this, mGamepad);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (PadSettings.get(this).enabled()) installGamepad();
+        if (PadSettings.get(this).enabled()) {
+            installGamepad();
+            getWindow().getDecorView().post(this::installGamepad);
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // Samsung rebuilds the window on a fold/rotate/DeX switch; re-stack.
+        getWindow().getDecorView().post(this::installGamepad);
     }
 
     /** Orientation chosen in the launcher (Graphics dialog); landscape by default. */

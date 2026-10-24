@@ -30,7 +30,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -266,6 +268,85 @@ void InstallCrashReporter(const std::string& log_dir) {
   });
 }
 
+// --- startup timeline -------------------------------------------------------
+// logs/startup.txt: one line per milestone with the milliseconds elapsed since
+// the process started, flushed immediately. When a launch "just sits on a black
+// screen" this says exactly which stage never completed -- and unlike the log
+// file it is not affected by log_level or by log buffering.
+namespace diag {
+std::mutex g_mutex;
+std::string g_path;
+std::chrono::steady_clock::time_point g_start;
+
+// Marks before the log directory is known are dropped, but the clock still has
+// to start with the process so the first written line is not off by seconds.
+void StartClock() { g_start = std::chrono::steady_clock::now(); }
+
+void Begin(const std::string& log_dir) {
+  g_path = log_dir + "/startup.txt";
+  std::lock_guard<std::mutex> lock(g_mutex);
+  std::ofstream out(g_path, std::ios::trunc);
+  if (out) out << REX_APP_NAME " startup timeline (ms since process start)\n";
+}
+
+void Mark(const std::string& what) {
+  if (g_path.empty()) return;
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - g_start).count();
+  std::lock_guard<std::mutex> lock(g_mutex);
+  std::ofstream out(g_path, std::ios::app);
+  if (out) out << fmt::format("{:>8} ms  {}\n", ms, what);
+}
+
+// Page-in / throughput probe of the game data: the .cpk archives are read at
+// random offsets for the whole session, so a fat folder on slow storage (an
+// SD card, or /storage/emulated/0 through FUSE) is the difference between a
+// 40 s and a 5 minute load. Runs off the main thread.
+void ProbeGameData(const std::string& game_root) {
+  std::thread([game_root] {
+    // Let the actual load have the storage first; the probe is diagnostic, not
+    // load bearing, and 32 MB of contention at the worst moment would show up
+    // as the very stutter we are trying to measure.
+    std::this_thread::sleep_for(std::chrono::seconds(8));
+    std::error_code ec;
+    std::string best;
+    uintmax_t best_size = 0, total = 0;
+    int files = 0;
+    for (auto it = std::filesystem::recursive_directory_iterator(game_root, ec);
+         it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+      if (ec) break;
+      if (!it->is_regular_file(ec)) continue;
+      ++files;
+      const uintmax_t sz = it->file_size(ec);
+      total += sz;
+      if (sz > best_size) { best_size = sz; best = it->path().string(); }
+    }
+    Mark(fmt::format("game data: {} files, {} MB, largest {} MB", files, total >> 20,
+                     best_size >> 20));
+    if (best.empty() || best_size == 0) return;
+    std::FILE* f = std::fopen(best.c_str(), "rb");
+    if (!f) { Mark("game data: cannot open " + best); return; }
+    const size_t kChunk = 1 << 20;
+    std::vector<char> buf(kChunk);
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t got = 0;
+    while (got < (32u << 20)) {
+      size_t n = std::fread(buf.data(), 1, kChunk, f);
+      if (!n) break;
+      got += n;
+    }
+    std::fclose(f);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double mb_s = secs > 0 ? double(got) / (1024.0 * 1024.0) / secs : 0;
+    Mark(fmt::format("game data read speed: {:.1f} MB/s ({} MB from {})", mb_s, got >> 20,
+                     std::filesystem::path(best).filename().string()));
+    if (mb_s < 40.0) {
+      Mark("WARNING: slow game storage - keep the files on internal storage, not an SD card");
+    }
+  }).detach();
+}
+}  // namespace diag
+
 // --- built-in sampling profiler ---------------------------------------------
 // Every 5 ms each thread of the process gets SIGPROF; the handler records its
 // pc into a lock-free open-addressing table. Every 20 s a report is written to
@@ -404,15 +485,22 @@ void Dump(const std::map<int, ThreadCpu>& prev, const std::map<int, ThreadCpu>& 
 }
 
 void Start(const std::string& log_dir) {
-  const char* enable = std::getenv("REX_PROFILE");
-  if (!enable || enable[0] != '1') return;
+  // Modes: unset/empty -> cheap always-on sampling (20 Hz), "1" -> detailed
+  // (200 Hz), "0" -> off. The cheap mode costs well under 1% CPU (the old
+  // always-on 200 Hz mode was measurable stutter on a phone) and it is the only
+  // thing that can tell us where a hang is stuck after the fact.
+  const char* mode = std::getenv("REX_PROFILE");
+  if (mode && mode[0] == '0') return;
+  const bool detailed = mode && mode[0] == '1';
+  const int interval_ms = detailed ? 5 : 50;
+  const int ticks_per_dump = detailed ? 4000 : 400;  // 20 s in both modes
   g_path = log_dir + "/profile.txt";
   struct sigaction sa{};
   sa.sa_sigaction = OnSigprof;
   sa.sa_flags = SA_SIGINFO | SA_RESTART;
   sigemptyset(&sa.sa_mask);
   sigaction(SIGPROF, &sa, nullptr);
-  std::thread([] {
+  std::thread([interval_ms, ticks_per_dump] {
     pthread_setname_np(pthread_self(), "rex-profiler");
     const pid_t pid = getpid();
     const pid_t self = gettid();
@@ -422,7 +510,7 @@ void Start(const std::string& log_dir) {
     int ticks = 0;
     std::vector<int> tids;
     for (;;) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
       if ((ticks++ % 200) == 0) {  // refresh the thread list once a second
         tids.clear();
         std::error_code ec;
@@ -448,7 +536,7 @@ void Start(const std::string& log_dir) {
         if (rp[2] != 'R') continue;
         syscall(SYS_tgkill, pid, tid, SIGPROF);
       }
-      if (ticks % 4000 == 0) {  // 20 s
+      if (ticks % ticks_per_dump == 0) {  // 20 s
         auto cur = SampleThreads();
         auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double>(now - t_prev).count();
@@ -459,7 +547,7 @@ void Start(const std::string& log_dir) {
       }
     }
   }).detach();
-  ALOGI("profiler on: %s", g_path.c_str());
+  ALOGI("profiler on (%s): %s", detailed ? "detailed 200 Hz" : "cheap 20 Hz", g_path.c_str());
 }
 }  // namespace prof
 
@@ -510,10 +598,13 @@ int RunAndroidApp() {
   JavaVM* java_vm = QueryJavaVm();
   if (lib_dir.empty()) ALOGE("nativeLibraryDir unresolved - GPU plugin loading will fail");
 
+  diag::StartClock();
+  diag::Mark("start");
   if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
     ALOGE("SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
     return EXIT_FAILURE;
   }
+  diag::Mark("SDL video initialised");
   const char* external_c = SDL_GetAndroidExternalStoragePath();
   std::string external_dir = external_c ? external_c : "";
   if (external_dir.empty()) {
@@ -522,11 +613,17 @@ int RunAndroidApp() {
   }
 
   const std::string game_root = ReadTrimmedFile(external_dir + "/" + kConfigFileName);
-  const char* internal_c = SDL_GetAndroidInternalStoragePath();
-  LoadCustomVulkanDriver(internal_c ? internal_c : "", lib_dir);
   std::error_code ec;
   std::filesystem::create_directories(external_dir + "/data", ec);
   const std::string log_dir = ResolveLogDir(external_dir);
+  // Start the timeline as early as the directory is known: everything after
+  // this point lands in logs/startup.txt, including the stages that never
+  // finish when the screen stays black.
+  diag::Begin(log_dir);
+  diag::Mark(fmt::format("external dir {} / game root '{}'", external_dir, game_root));
+  const char* internal_c = SDL_GetAndroidInternalStoragePath();
+  LoadCustomVulkanDriver(internal_c ? internal_c : "", lib_dir);
+  diag::Mark("GPU driver hook installed");
   const std::string log_file_path = fmt::format("{}/{}.log", log_dir, kAppIdentifier);
   // Rotate previous run's log so each launch starts cleanly without mixing
   // diagnostics from earlier runs.
@@ -536,12 +633,16 @@ int RunAndroidApp() {
   // user has seen it (or chose to play again) -- start clean.
   std::filesystem::remove(log_dir + "/crash.txt", ec);
   InstallCrashReporter(log_dir);
+  diag::Mark(fmt::format("log dir {}", log_dir));
   prof::Start(log_dir);
 
   rex::SetAndroidApplicationContext(java_vm, SDL_GetAndroidActivity(), lib_dir.c_str());
   rex::thread::AndroidInitialize();
+  diag::Mark("thread runtime ready");
   rex::memory::AndroidInitialize();
+  diag::Mark("memory runtime ready (512 MB guest arena reserved)");
   rex::filesystem::AndroidInitialize();
+  diag::Mark("filesystem runtime ready");
 
   // The port's src/<name>_app.h carries rexauto's desktop "portable paths"
   // hook (game in <exe>/assets, saves in <exe>/userdata). On Android the exe
@@ -587,6 +688,12 @@ int RunAndroidApp() {
   args.emplace_back("--ignore_thread_affinities=true");
   args.emplace_back("--ignore_thread_priorities=true");
   args.emplace_back("--log_flush_interval=5");  // batch log writes
+  // Never block the guest thread on a dialog: the runtime's debug overlay is
+  // not composited over the game surface on Android, so XamShowMessageBoxUI
+  // would wait forever for a button nobody can see and the title would sit
+  // there looking frozen. headless answers every prompt with its default
+  // (settings.txt can still override this).
+  args.emplace_back("--headless=true");
   // Pipeline creation workers: the SDK default is (cores * 3 / 4) -- six
   // glslang/SPIRV-Tools threads on an 8-core big.LITTLE phone, all fighting the
   // two Cortex-A76 cores that are actually running the guest. Two keeps the
@@ -605,6 +712,8 @@ int RunAndroidApp() {
   (void)remaining;
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
+  diag::Mark(fmt::format("cvars applied ({} args)", argv_ptrs.size()));
+  if (!game_root.empty()) diag::ProbeGameData(game_root);
 
   REXLOG_INFO("android_main: app={} external_dir={} game_root={}", kAppIdentifier,
               external_dir, game_root);
@@ -622,10 +731,16 @@ int RunAndroidApp() {
                    kAppIdentifier);
       return EXIT_FAILURE;
     }
+    diag::Mark("SDL window + app context created");
     std::unique_ptr<rex::ui::WindowedApp> app = creator(app_context);
+    diag::Mark("app instance created - OnInitialize (this is the long part: VFS mount, "
+               "xex load, pipeline cache) starts now");
     if (app->OnInitialize()) {
+      diag::Mark("OnInitialize done");
       rexport::gamepad::EnsureVirtualPadAttached();
+      diag::Mark("touch gamepad attach requested - entering the message loop");
       result = app_context.RunMainMessageLoop();
+      diag::Mark(fmt::format("message loop exited ({})", result));
     } else {
       REXLOG_ERROR("OnInitialize failed - see earlier errors");
       result = EXIT_FAILURE;

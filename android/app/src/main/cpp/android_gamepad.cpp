@@ -36,7 +36,10 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <mutex>
+#include <thread>
 
 #include <rex/logging.h>
 
@@ -112,11 +115,58 @@ bool AttachLocked() {
   return true;
 }
 
+bool AttachedButUnopened() {
+  // A virtual joystick only reaches the game if the runtime's SDL input driver
+  // opened it, which it does in reaction to SDL_EVENT_GAMEPAD_ADDED. That event
+  // is delivered once, through the event watch the driver installs when its
+  // window is attached - if our AttachVirtualJoystick() wins that race the
+  // event is simply gone and every guest XInputGetState() reports "no device",
+  // i.e. the controls do nothing at all.
+  //
+  // SDL_GetGamepadFromID() is the observable side of the driver's open: it
+  // returns the SDL_Gamepad created by SDL_OpenGamepad() for this instance,
+  // and nothing else in the process opens one. Null means "nobody picked the
+  // pad up", so nobody can be using it and dropping it is safe.
+  if (!g_joystick || !g_instance) return false;
+  return SDL_GetGamepadFromID(g_instance) == nullptr;
+}
+
 }  // namespace
 
 bool EnsureVirtualPadAttached() {
-  std::lock_guard<std::mutex> guard(g_mutex);
-  return AttachLocked();
+  {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    if (!AttachLocked()) return false;
+  }
+  // Re-announce until the driver has it. Detach + attach produces a fresh
+  // GAMEPAD_ADDED (and a GAMEPAD_REMOVED the driver ignores if it never opened
+  // it), so a lost first event costs a few hundred milliseconds instead of the
+  // whole session. Stops as soon as the pad is open, and gives up after
+  // ~15 s so a driver that legitimately rejects it is not spammed forever.
+  std::thread([] {
+    pthread_setname_np(pthread_self(), "rex-pad-attach");
+    for (int attempt = 0; attempt < 6; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(attempt == 0 ? 1500 : 2500));
+      std::lock_guard<std::mutex> guard(g_mutex);
+      if (!AttachedButUnopened()) {
+        REXLOG_WARN("virtual gamepad: picked up by the input driver (attempt {})", attempt + 1);
+        return;
+      }
+      REXLOG_WARN(
+          "virtual gamepad: not picked up by the input driver yet - re-announcing (attempt {})",
+          attempt + 1);
+      if (g_joystick) {
+        SDL_CloseJoystick(g_joystick);
+        g_joystick = nullptr;
+      }
+      if (g_instance) {
+        SDL_DetachVirtualJoystick(g_instance);
+        g_instance = 0;
+      }
+      AttachLocked();
+    }
+  }).detach();
+  return true;
 }
 
 }  // namespace rexport::gamepad

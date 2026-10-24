@@ -17,9 +17,34 @@ import java.util.Map;
  */
 public final class GraphicsSettings {
     private final SharedPreferences prefs;
+    private final int ramMb;
 
     public GraphicsSettings(Context ctx) {
         prefs = ctx.getSharedPreferences("graphics", Context.MODE_PRIVATE);
+        ramMb = queryTotalRamMb(ctx);
+    }
+
+    /** Total physical RAM; a 4 GB tablet must not be configured like a 12 GB one. */
+    private static int queryTotalRamMb(Context ctx) {
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) {
+                android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+                am.getMemoryInfo(mi);
+                return (int) (mi.totalMem >> 20);
+            }
+        } catch (Throwable ignored) {
+        }
+        return 4096;
+    }
+
+    private int totalRamMb() {
+        return ramMb > 0 ? ramMb : 4096;
+    }
+
+    private static int clampInt(int v, int min, int max) {
+        return v < min ? min : (v > max ? max : v);
     }
 
     // --- knobs (defaults tuned for a mid-range Adreno/Mali phone) -----------
@@ -59,6 +84,20 @@ public final class GraphicsSettings {
     public boolean asyncShaders() { return prefs.getBoolean("async_shaders", true); }
     public void setAsyncShaders(boolean v) { prefs.edit().putBoolean("async_shaders", v).apply(); }
 
+    /**
+     * Answer the game's own system prompts (message boxes, keyboard-input
+     * dialogs) immediately with their default choice instead of showing them.
+     * On Android the runtime's debug overlay is not composited over the game,
+     * so a real prompt can stall the guest thread forever on a dialog nobody
+     * can see -- the game looks frozen and ignores every input.
+     */
+    public boolean autoAnswerPrompts() { return prefs.getBoolean("auto_prompts", true); }
+    public void setAutoAnswerPrompts(boolean v) { prefs.edit().putBoolean("auto_prompts", v).apply(); }
+
+    /** Verbose (info-level) runtime log; off costs less, on explains more. */
+    public boolean verboseLog() { return prefs.getBoolean("verbose_log", false); }
+    public void setVerboseLog(boolean v) { prefs.edit().putBoolean("verbose_log", v).apply(); }
+
     /** Screen orientation while playing: landscape (default) | portrait | auto. */
     public String orientation() { return prefs.getString("orientation", "landscape"); }
     public void setOrientation(String v) { prefs.edit().putString("orientation", v).apply(); }
@@ -81,13 +120,12 @@ public final class GraphicsSettings {
     public void setPreset(String v) { prefs.edit().putString("preset", v).apply(); }
 
     /**
-     * Frame-rate cap 0 = off. 30 is the default because virtually every Xbox
-     * 360 title this launcher targets (XenoVerse included) paced itself on a
-     * 30 Hz vblank: capping the guest vblank at 30 Hz halves GPU work and
-     * removes the "render 60, show 30" waste that made phones throttle after
-     * a few minutes and stutter instead of holding a flat 30.
+     * Frame-rate cap 0 = off (default). It works by slowing the GUEST vblank,
+     * so a title that paces its logic on vblank (most 360 games) then runs in
+     * slow motion rather than at a lower frame rate -- which is why this stays
+     * off unless the user picks it deliberately in the Graphics dialog.
      */
-    public int fpsCap() { return prefs.getInt("fps_cap", 30); }
+    public int fpsCap() { return prefs.getInt("fps_cap", 0); }
     public void setFpsCap(int v) { prefs.edit().putInt("fps_cap", v).apply(); }
 
     /** Extra raw cvars (advanced): "key=value" per line. */
@@ -113,12 +151,14 @@ public final class GraphicsSettings {
             m.put("readback_memexport", "false");
             m.put("vulkan_readback_memexport", "false");
             m.put("vulkan_readback_resolve", "false");
-            // Texture cache: keep the SDK defaults (384 MB soft / 768 MB hard).
-            // The old 192/384 halved them, which made a 7 GB title evict and
-            // re-upload live textures every frame -- that was the constant
-            // hitching while running around.
-            m.put("texture_cache_memory_limit_soft", "384");
-            m.put("texture_cache_memory_limit_hard", "768");
+            // Texture cache sized to the device instead of a fixed guess: the
+            // hard limit must leave room for the guest arena plus the game's
+            // own heap, or Android kills the process. ~1/8 soft, ~1/6 hard.
+            int total = totalRamMb();
+            int soft = clampInt((int) (total * 0.125), 128, 512);
+            int hard = clampInt((int) (total * 0.17), 256, 1024);
+            m.put("texture_cache_memory_limit_soft", Integer.toString(soft));
+            m.put("texture_cache_memory_limit_hard", Integer.toString(hard));
             m.put("texture_cache_memory_limit_render_to_texture", "32");
             // Shader/pipeline compilation MUST stay async: the alternative
             // compiles every first-use pipeline on the render thread, which on
@@ -138,7 +178,7 @@ public final class GraphicsSettings {
             m.put("vulkan_allow_present_mode_mailbox", "false");
             m.put("vulkan_allow_present_mode_fifo_relaxed", "true");
             // log I/O on the render/guest threads is not free
-            m.put("log_level", "warning");
+            m.put("log_level", verboseLog() ? "info" : "warning");
             m.put("log_high_frequency_kernel_calls", "false");
             m.put("vulkan_log_debug_messages", "false");
             m.put("gpu_debug_markers", "false");
@@ -155,6 +195,8 @@ public final class GraphicsSettings {
         }
         // Explicit override of the preset's value, so the checkbox always wins.
         m.put("async_shader_compilation", Boolean.toString(asyncShaders()));
+        // headless = never block the guest on a dialog; see autoAnswerPrompts().
+        m.put("headless", Boolean.toString(autoAnswerPrompts()));
         if (fpsCap() > 0) m.put("env.REX_FPS_CAP", Integer.toString(fpsCap()));
         // "env.NAME=value" lines are exported as environment variables by the
         // native side (the dispatcher reads REX_HEAL_DISCOVER via getenv).

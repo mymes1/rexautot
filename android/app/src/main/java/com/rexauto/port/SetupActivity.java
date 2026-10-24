@@ -299,9 +299,46 @@ public class SetupActivity extends Activity {
             File[] saved = save.listFiles();
             b.append("save_files: ").append(saved == null ? "?" : String.valueOf(saved.length)).append('\n');
         }
+        b.append("game_disk: ").append(readSpeedMbPerSecond(root)).append('\n');
         String settings = tail(GameFiles.settingsFile(this), 2000);
         if (!settings.isEmpty()) b.append("--- settings.txt ---\n").append(settings).append('\n');
         return b.toString();
+    }
+
+    /**
+     * Reads 16 MB of the biggest file in the game folder and reports MB/s. The
+     * .cpk archives are streamed for the whole session, so ~20 MB/s (an SD
+     * card) turns a 40 second load into five minutes.
+     */
+    private static String readSpeedMbPerSecond(String root) {
+        if (root == null) return "n/a";
+        File dir = new File(root);
+        File biggest = null;
+        File[] kids = dir.listFiles();
+        if (kids != null) {
+            for (File k : kids) {
+                if (k.isFile() && (biggest == null || k.length() > biggest.length())) biggest = k;
+            }
+        }
+        if (biggest == null || biggest.length() == 0) return "n/a";
+        long budget = Math.min(biggest.length(), 16L << 20);
+        byte[] buf = new byte[(int) Math.min(budget, 1 << 20)];
+        long got = 0;
+        long started = System.nanoTime();
+        try (java.io.FileInputStream in = new java.io.FileInputStream(biggest)) {
+            while (got < budget) {
+                int n = in.read(buf, 0, (int) Math.min(buf.length, budget - got));
+                if (n <= 0) break;
+                got += n;
+            }
+        } catch (Exception e) {
+            return e.getClass().getSimpleName();
+        }
+        double secs = (System.nanoTime() - started) / 1e9;
+        if (secs <= 0 || got <= 0) return "n/a";
+        double mbps = (got / (1024.0 * 1024.0)) / secs;
+        return String.format(Locale.US, "%.1f MB/s from %s%s", mbps, biggest.getName(),
+                mbps < 40 ? " (SLOW - move the game files to internal storage)" : "");
     }
 
     private void showLogsDialog() {
@@ -309,13 +346,15 @@ public class SetupActivity extends Activity {
         String cur = tail(crashFile(), 4000);
         String prevLog = tail(new File(logsDir(), BuildConfig.PROJECT + ".prev.log"), 3000);
         String log = tail(gameLog(), 6000);
-        String prof = tail(new File(logsDir(), "profile.txt"), 5000);
+        String prof = tail(new File(logsDir(), "profile.txt"), 6000);
+        String startup = tail(new File(logsDir(), "startup.txt"), 4000);
         String crash = (cur.isEmpty() ? prev : cur);
         String text = diagnostics() + "\n";
         if (!crash.isEmpty()) text += "--- last crash ---\n" + crash + "\n";
         if (State.lastError != null && !State.lastError.isEmpty()) {
             text = "--- last import error ---\n" + State.lastError + "\n\n" + text;
         }
+        if (!startup.isEmpty()) text += "--- startup timeline (did it get past the logo?) ---\n" + startup + "\n";
         if (!prof.isEmpty()) text += "--- profile (where CPU time goes) ---\n" + prof + "\n";
         text += "--- " + BuildConfig.PROJECT + ".log (tail) ---\n" + (log.isEmpty() ? "(no log yet)" : log);
         if (!prevLog.isEmpty()) {
@@ -1195,6 +1234,16 @@ public class SetupActivity extends Activity {
         letterbox.setChecked(gs.letterbox());
         box.addView(letterbox);
 
+        CheckBox prompts = new CheckBox(this);
+        prompts.setText("Auto-answer game prompts (recommended — a prompt nobody can see freezes the game)");
+        prompts.setChecked(gs.autoAnswerPrompts());
+        box.addView(prompts);
+
+        CheckBox verbose = new CheckBox(this);
+        verbose.setText("Verbose log (slower, but explains what the game is doing)");
+        verbose.setChecked(gs.verboseLog());
+        box.addView(verbose);
+
         CheckBox async = new CheckBox(this);
         async.setText("Async shader compile (faster loads, minus a stall per new effect)");
         async.setChecked(gs.asyncShaders());
@@ -1227,6 +1276,8 @@ public class SetupActivity extends Activity {
                     gs.setOrientation(orients[orient.getSelectedItemPosition()]);
                     gs.setVsync(vsync.isChecked());
                     gs.setLetterbox(letterbox.isChecked());
+                    gs.setAutoAnswerPrompts(prompts.isChecked());
+                    gs.setVerboseLog(verbose.isChecked());
                     gs.setAsyncShaders(async.isChecked());
                     gs.setTolerant(tolerant.isChecked());
                     gs.setExtra(extra.getText().toString());

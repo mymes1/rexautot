@@ -185,23 +185,45 @@ public class VirtualPadView extends View {
      * or null when the layout was unavailable.
      */
     public static VirtualPadView install(Activity activity) {
+        return install(activity, null);
+    }
+
+    /**
+     * Same as {@link #install(Activity)}, but re-attaches {@code existing}
+     * instead of building a new overlay. SDLActivity rebuilds its view
+     * hierarchy on a surface re-creation (rotation, task switch, a display
+     * change on Samsung tablets); the old overlay is then detached and stops
+     * receiving touches while still looking present, which reads exactly like
+     * "the game ignores my controls".
+     */
+    public static VirtualPadView install(Activity activity, VirtualPadView existing) {
         android.view.ViewGroup layout;
         try {
             layout = (android.view.ViewGroup) org.libsdl.app.SDLActivity.getContentView();
         } catch (Throwable t) {
             Log.w(TAG, "SDL layout unavailable - virtual gamepad disabled", t);
-            return null;
+            return existing;
         }
         if (layout == null) {
             Log.w(TAG, "SDL layout is null - virtual gamepad disabled");
-            return null;
+            return existing;
         }
         android.view.ViewGroup.LayoutParams lp = new android.view.ViewGroup.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT);
-        VirtualPadView view = new VirtualPadView(activity);
+        VirtualPadView view = existing != null ? existing : new VirtualPadView(activity);
+        if (view.getParent() == layout) {
+            view.bringToFront();
+            return view;
+        }
+        if (view.getParent() instanceof android.view.ViewGroup) {
+            ((android.view.ViewGroup) view.getParent()).removeView(view);
+        }
         layout.addView(view, lp);
-        Log.i(TAG, "virtual gamepad overlay installed");
+        view.bringToFront();
+        view.requestLayout();
+        Log.i(TAG, existing != null ? "virtual gamepad overlay re-attached"
+                                    : "virtual gamepad overlay installed");
         return view;
     }
 
