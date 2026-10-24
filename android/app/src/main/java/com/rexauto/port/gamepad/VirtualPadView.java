@@ -87,6 +87,8 @@ public class VirtualPadView extends View {
     private final float[] mEase = new float[14];         // animated 0..1 per control
     private int mDpadMask;
     private boolean mHidden;
+    /** One-shot guard: only tell the user once that the pad is not wired up. */
+    private boolean mWarnedNotAttached;
     private final int[] mInset = new int[4];             // L T R B safe insets
 
     private boolean mTicking;
@@ -339,6 +341,16 @@ public class VirtualPadView extends View {
         }
 
         if (control >= 0) {
+            // The JNI setters are no-ops until libmain.so attached its SDL
+            // virtual gamepad. If that never happened the controls are drawn
+            // but the game sees nothing -- say so instead of looking dead.
+            if (!mWarnedNotAttached && !PadInputBridge.isAttached()) {
+                mWarnedNotAttached = true;
+                Log.w(TAG, "virtual pad not attached to the native side");
+                android.widget.Toast.makeText(getContext(),
+                        "Touch controls are not connected to the game. Close the game and start it again from the launcher.",
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
             mPressed[control] = true;
             mPressAt[control] = SystemClock.uptimeMillis();
             performHaptic();

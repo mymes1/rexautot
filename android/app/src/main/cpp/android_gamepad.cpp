@@ -89,7 +89,7 @@ bool AttachLocked() {
   desc.axis_mask = kAxisMask;
   desc.vendor_id = kVendorId;
   desc.product_id = kProductId;
-  desc.name = "Dante's Inferno Touch Pad";
+  desc.name = "rexauto touch pad";
 
   g_instance = SDL_AttachVirtualJoystick(&desc);
   if (!g_instance) {
@@ -105,7 +105,9 @@ bool AttachLocked() {
     g_instance = 0;
     return false;
   }
-  REXLOG_INFO("virtual gamepad: attached (instance {}, {} buttons, {} axes)",
+  // WARN, not INFO: the launcher runs with log_level=warning, and "did the
+  // pad attach?" is the first thing to check when touch controls "do nothing".
+  REXLOG_WARN("virtual gamepad: attached (instance {}, {} buttons, {} axes)",
               static_cast<unsigned>(g_instance), kNumButtons, kNumAxes);
   return true;
 }
@@ -124,6 +126,13 @@ bool EnsureVirtualPadAttached() {
 // ---------------------------------------------------------------------------
 
 extern "C" {
+
+JNIEXPORT jboolean JNICALL
+Java_com_rexauto_port_gamepad_PadInputBridge_nativeIsAttached(JNIEnv* /*env*/,
+                                                             jclass /*clazz*/) {
+  std::lock_guard<std::mutex> guard(rexport::gamepad::g_mutex);
+  return rexport::gamepad::g_joystick ? JNI_TRUE : JNI_FALSE;
+}
 
 JNIEXPORT jboolean JNICALL
 Java_com_rexauto_port_gamepad_PadInputBridge_nativeSetButton(

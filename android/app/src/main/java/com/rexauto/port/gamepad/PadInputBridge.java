@@ -52,6 +52,20 @@ public final class PadInputBridge {
     private PadInputBridge() {
     }
 
+    /**
+     * True once the native side has attached its SDL virtual gamepad. False
+     * means every set* call below is silently dropped (libmain.so not loaded
+     * yet, or the app is still starting) - the overlay uses this to explain
+     * itself instead of looking broken.
+     */
+    public static boolean isAttached() {
+        try {
+            return nativeIsAttached();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     public static void setButton(int button, boolean down) {
         try {
             nativeSetButton(button, down);
@@ -76,6 +90,8 @@ public final class PadInputBridge {
         } catch (Throwable ignored) {
         }
     }
+
+    private static native boolean nativeIsAttached();
 
     private static native void nativeSetButton(int button, boolean down);
 

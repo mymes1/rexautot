@@ -48,6 +48,17 @@ public final class GraphicsSettings {
     public boolean tolerant() { return prefs.getBoolean("tolerant", true); }
     public void setTolerant(boolean v) { prefs.edit().putBoolean("tolerant", v).apply(); }
 
+    /**
+     * Compile shaders / create pipelines on background threads instead of on
+     * the render thread. On by default: the synchronous path freezes for
+     * hundreds of milliseconds at every first-use effect on a Mali GPU, which
+     * is the difference between "loads in a minute" and "loads in five".
+     * Turning it off is the fallback if a title shows missing geometry while
+     * the pipelines warm up.
+     */
+    public boolean asyncShaders() { return prefs.getBoolean("async_shaders", true); }
+    public void setAsyncShaders(boolean v) { prefs.edit().putBoolean("async_shaders", v).apply(); }
+
     /** Screen orientation while playing: landscape (default) | portrait | auto. */
     public String orientation() { return prefs.getString("orientation", "landscape"); }
     public void setOrientation(String v) { prefs.edit().putString("orientation", v).apply(); }
@@ -69,8 +80,14 @@ public final class GraphicsSettings {
     public String preset() { return prefs.getString("preset", "performance"); }
     public void setPreset(String v) { prefs.edit().putString("preset", v).apply(); }
 
-    /** Frame-rate cap 0 = off. 30 halves GPU work for games that already ran at 30 on the 360. */
-    public int fpsCap() { return prefs.getInt("fps_cap", 0); }
+    /**
+     * Frame-rate cap 0 = off. 30 is the default because virtually every Xbox
+     * 360 title this launcher targets (XenoVerse included) paced itself on a
+     * 30 Hz vblank: capping the guest vblank at 30 Hz halves GPU work and
+     * removes the "render 60, show 30" waste that made phones throttle after
+     * a few minutes and stutter instead of holding a flat 30.
+     */
+    public int fpsCap() { return prefs.getInt("fps_cap", 30); }
     public void setFpsCap(int v) { prefs.edit().putInt("fps_cap", v).apply(); }
 
     /** Extra raw cvars (advanced): "key=value" per line. */
@@ -96,15 +113,25 @@ public final class GraphicsSettings {
             m.put("readback_memexport", "false");
             m.put("vulkan_readback_memexport", "false");
             m.put("vulkan_readback_resolve", "false");
-            // texture cache: keep well under what a 4-6 GB phone can give us
-            m.put("texture_cache_memory_limit_soft", "192");
-            m.put("texture_cache_memory_limit_hard", "384");
-            m.put("texture_cache_memory_limit_render_to_texture", "16");
-            // execute all draws faithfully (one-shot RTT passes such as YEBIS 2
-            // tone-map LUT bakes and character portraits must not run against a
-            // blank placeholder shader, and frames must never be skipped at present)
-            m.put("async_shader_compilation", "false");
+            // Texture cache: keep the SDK defaults (384 MB soft / 768 MB hard).
+            // The old 192/384 halved them, which made a 7 GB title evict and
+            // re-upload live textures every frame -- that was the constant
+            // hitching while running around.
+            m.put("texture_cache_memory_limit_soft", "384");
+            m.put("texture_cache_memory_limit_hard", "768");
+            m.put("texture_cache_memory_limit_render_to_texture", "32");
+            // Shader/pipeline compilation MUST stay async: the alternative
+            // compiles every first-use pipeline on the render thread, which on
+            // a Mali-G57 means multi-second freezes at load and a hitch every
+            // time a new effect appears. Frames are never skipped while a
+            // pipeline is warming up (see vulkan_async_skip_incomplete_frames),
+            // so this cannot black-screen like the old surface bug did.
+            m.put("async_shader_compilation", "true");
             m.put("vulkan_async_skip_incomplete_frames", "false");
+            // Default (-1) spawns (cores * 3 / 4) compilation workers: 6 threads
+            // on a Helio G99, all burning the two big cores while the guest
+            // threads try to run. Two keeps the big cores for the game.
+            m.put("vulkan_pipeline_creation_threads", "2");
             // present: FIFO only (mailbox/immediate keep the GPU busy rendering
             // frames the panel never shows -- pure heat on a phone)
             m.put("vulkan_allow_present_mode_immediate", "false");
@@ -126,6 +153,8 @@ public final class GraphicsSettings {
         } else if (p.equals("balanced")) {
             m.put("anisotropic_override", "3");          // 4x
         }
+        // Explicit override of the preset's value, so the checkbox always wins.
+        m.put("async_shader_compilation", Boolean.toString(asyncShaders()));
         if (fpsCap() > 0) m.put("env.REX_FPS_CAP", Integer.toString(fpsCap()));
         // "env.NAME=value" lines are exported as environment variables by the
         // native side (the dispatcher reads REX_HEAL_DISCOVER via getenv).

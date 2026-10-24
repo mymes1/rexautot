@@ -29,6 +29,56 @@ public final class GameFiles {
         return new File(ext != null ? ext : ctx.getFilesDir(), "settings.txt");
     }
 
+    /** Guest user-data root (--user_data_root): saves, profiles, installed DLC. */
+    public static File dataRoot(Context ctx) {
+        File ext = ctx.getExternalFilesDir(null);
+        return new File(ext != null ? ext : ctx.getFilesDir(), "data");
+    }
+
+    /**
+     * Where the runtime keeps this title's profile/save data:
+     * {@code <user_data_root>/<TITLEID>/profile/User} (see ContentManager::
+     * ResolveGameUserContentPath in the SDK). Null when the title ID cannot be
+     * read from the xex.
+     */
+    public static File saveDir(Context ctx) {
+        String root = configuredGameRoot(ctx);
+        if (root == null) return null;
+        String titleId = xexTitleId(new File(root, "default.xex"));
+        if (titleId == null) return null;
+        return new File(new File(new File(dataRoot(ctx), titleId), "profile"), "User");
+    }
+
+    /**
+     * Creates the content root and the profile directory up front and proves
+     * they are writable. On Android the first create inside
+     * {@code Android/data/...} after an update can fail while the FUSE mount is
+     * still settling; when that happens the title reports "no save data found"
+     * and re-prompts forever, so doing it here turns a mystery into a message.
+     *
+     * @return null on success, otherwise a human readable reason.
+     */
+    public static String ensureSaveDirs(Context ctx) {
+        File save = saveDir(ctx);
+        // No xex yet, or its header could not be parsed: nothing to preflight
+        // (and definitely not an error worth alarming the user about).
+        if (save == null) return null;
+        try {
+            if (!save.isDirectory() && !save.mkdirs() && !save.isDirectory()) {
+                return "cannot create " + save;
+            }
+            File probe = new File(save, ".write_probe");
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(probe)) {
+                out.write('x');
+            }
+            //noinspection ResultOfMethodCallIgnored
+            probe.delete();
+            return null;
+        } catch (Exception e) {
+            return e.getClass().getSimpleName() + " while preparing " + save;
+        }
+    }
+
     public static String configuredGameRoot(Context ctx) {
         try {
             File config = configFile(ctx);

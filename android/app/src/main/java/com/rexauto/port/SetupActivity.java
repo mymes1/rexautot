@@ -251,14 +251,68 @@ public class SetupActivity extends Activity {
                 .show();
     }
 
+    /**
+     * Everything needed to explain a stutter / "no save data" / input report:
+     * the device, where the game files actually are, where the save data is
+     * supposed to live, and the cvars the native side was started with.
+     */
+    private String diagnostics() {
+        StringBuilder b = new StringBuilder();
+        b.append("--- diagnostics ---\n");
+        b.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
+        b.append("android: ").append(Build.VERSION.RELEASE)
+                .append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n");
+        b.append("cores: ").append(Runtime.getRuntime().availableProcessors()).append('\n');
+        try {
+            if (Build.SUPPORTED_ABIS.length > 0) b.append("abi: ").append(Build.SUPPORTED_ABIS[0]).append('\n');
+        } catch (Throwable ignored) {
+        }
+        File ext = getExternalFilesDir(null);
+        if (ext != null) {
+            b.append("free: ").append(ext.getUsableSpace() >> 20).append(" MB of ")
+                    .append(ext.getTotalSpace() >> 20).append(" MB\n");
+        }
+        String root = GameFiles.configuredGameRoot(this);
+        b.append("game_root: ").append(root == null ? "(not set)" : root).append('\n');
+        if (root != null) {
+            File dir = new File(root);
+            File[] kids = dir.listFiles();
+            b.append("game_files: ");
+            if (kids == null) {
+                b.append("(cannot list - folder not readable!)\n");
+            } else {
+                int shown = 0;
+                long total = 0;
+                for (File k : kids) {
+                    if (!k.isFile()) continue;
+                    total += k.length();
+                    if (shown++ < 12) b.append(k.getName()).append('(').append(k.length() >> 20).append("MB) ");
+                }
+                b.append('\n').append("game_total: ").append(shown).append(" files, ")
+                        .append(total >> 20).append(" MB\n");
+            }
+        }
+        File save = GameFiles.saveDir(this);
+        b.append("save_dir: ").append(save == null ? "(unknown title id)" : save.toString())
+                .append(save != null && save.isDirectory() ? " (exists)" : " (missing)").append('\n');
+        if (save != null && save.isDirectory()) {
+            File[] saved = save.listFiles();
+            b.append("save_files: ").append(saved == null ? "?" : String.valueOf(saved.length)).append('\n');
+        }
+        String settings = tail(GameFiles.settingsFile(this), 2000);
+        if (!settings.isEmpty()) b.append("--- settings.txt ---\n").append(settings).append('\n');
+        return b.toString();
+    }
+
     private void showLogsDialog() {
         String prev = tail(new File(logsDir(), "crash.prev.txt"), 4000);
         String cur = tail(crashFile(), 4000);
         String prevLog = tail(new File(logsDir(), BuildConfig.PROJECT + ".prev.log"), 3000);
         String log = tail(gameLog(), 6000);
         String prof = tail(new File(logsDir(), "profile.txt"), 5000);
-        String text = (cur.isEmpty() ? prev : cur);
-        if (!text.isEmpty()) text = "--- last crash ---\n" + text + "\n";
+        String crash = (cur.isEmpty() ? prev : cur);
+        String text = diagnostics() + "\n";
+        if (!crash.isEmpty()) text += "--- last crash ---\n" + crash + "\n";
         if (State.lastError != null && !State.lastError.isEmpty()) {
             text = "--- last import error ---\n" + State.lastError + "\n\n" + text;
         }
@@ -1141,6 +1195,11 @@ public class SetupActivity extends Activity {
         letterbox.setChecked(gs.letterbox());
         box.addView(letterbox);
 
+        CheckBox async = new CheckBox(this);
+        async.setText("Async shader compile (faster loads, minus a stall per new effect)");
+        async.setChecked(gs.asyncShaders());
+        box.addView(async);
+
         CheckBox tolerant = new CheckBox(this);
         tolerant.setText(R.string.gfx_tolerant);
         tolerant.setChecked(gs.tolerant());
@@ -1168,6 +1227,7 @@ public class SetupActivity extends Activity {
                     gs.setOrientation(orients[orient.getSelectedItemPosition()]);
                     gs.setVsync(vsync.isChecked());
                     gs.setLetterbox(letterbox.isChecked());
+                    gs.setAsyncShaders(async.isChecked());
                     gs.setTolerant(tolerant.isChecked());
                     gs.setExtra(extra.getText().toString());
                     try { gs.write(this); } catch (Exception e) { Toast.makeText(this, e.toString(), Toast.LENGTH_LONG).show(); }
@@ -1185,6 +1245,17 @@ public class SetupActivity extends Activity {
 
     private void launchGame() {
         try { new GraphicsSettings(this).write(this); } catch (Exception ignored) { }
+        // Create <data>/<TITLEID>/profile/User and prove it is writable before
+        // the runtime starts. The title's first act after its logo is to look
+        // for save data; if the very first mkdir inside Android/data fails (it
+        // does happen right after an update while the FUSE mount settles) the
+        // game either loops on "no save data found" or freezes on the prompt.
+        String saveProblem = GameFiles.ensureSaveDirs(this);
+        if (saveProblem != null) {
+            State.lastError = "Save data folder problem: " + saveProblem
+                    + " — the game may not be able to save. Free space and try again.";
+            Toast.makeText(this, State.lastError, Toast.LENGTH_LONG).show();
+        }
         startActivity(new Intent(this, MainActivity.class));
     }
 }

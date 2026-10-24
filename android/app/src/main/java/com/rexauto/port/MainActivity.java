@@ -34,8 +34,26 @@ public class MainActivity extends SDLActivity {
             w.setAttributes(lp);
         }
         if (PadSettings.get(this).enabled()) {
-            mGamepad = VirtualPadView.install(this);
+            installGamepad();
+            if (mGamepad == null) {
+                // Some Samsung builds inflate SDL's view hierarchy a frame later
+                // than the activity; retry once the decor view has laid out so
+                // the touch controls can never silently go missing.
+                getWindow().getDecorView().post(this::installGamepad);
+            }
         }
+    }
+
+    private void installGamepad() {
+        if (mGamepad != null) return;
+        mGamepad = VirtualPadView.install(this);
+        if (mGamepad != null) mGamepad.bringToFront();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (PadSettings.get(this).enabled()) installGamepad();
     }
 
     /** Orientation chosen in the launcher (Graphics dialog); landscape by default. */

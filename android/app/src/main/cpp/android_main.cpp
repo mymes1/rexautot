@@ -271,8 +271,12 @@ void InstallCrashReporter(const std::string& log_dir) {
 // pc into a lock-free open-addressing table. Every 20 s a report is written to
 // <logs>/profile.txt: per-thread CPU%, per-core clock (throttling), and the
 // top sampled host functions resolved through dladdr (sub_XXXXXXXX = guest
-// function, librexruntime/librexgpu = runtime). Costs well under 1% CPU.
-// Disabled with settings.txt `env.REX_PROFILE=0`.
+// function, librexruntime/librexgpu = runtime).
+//
+// OFF by default: sampling every 5 ms means ~200 signals per running thread and
+// a /proc/self/task/*/stat read for every one of them from the profiler thread,
+// which is measurable stutter on a phone doing 30 fps. Turn it on for a
+// diagnosis run with settings.txt `env.REX_PROFILE=1`.
 namespace prof {
 constexpr size_t kSlots = 1 << 16;  // power of two
 struct Slot { std::atomic<uintptr_t> pc; std::atomic<uint32_t> n; };
@@ -400,7 +404,8 @@ void Dump(const std::map<int, ThreadCpu>& prev, const std::map<int, ThreadCpu>& 
 }
 
 void Start(const std::string& log_dir) {
-  if (const char* e = std::getenv("REX_PROFILE"); e && e[0] == '0') return;
+  const char* enable = std::getenv("REX_PROFILE");
+  if (!enable || enable[0] != '1') return;
   g_path = log_dir + "/profile.txt";
   struct sigaction sa{};
   sa.sa_sigaction = OnSigprof;
@@ -582,6 +587,11 @@ int RunAndroidApp() {
   args.emplace_back("--ignore_thread_affinities=true");
   args.emplace_back("--ignore_thread_priorities=true");
   args.emplace_back("--log_flush_interval=5");  // batch log writes
+  // Pipeline creation workers: the SDK default is (cores * 3 / 4) -- six
+  // glslang/SPIRV-Tools threads on an 8-core big.LITTLE phone, all fighting the
+  // two Cortex-A76 cores that are actually running the guest. Two keeps the
+  // game threads fed while still hiding shader-compile latency.
+  args.emplace_back("--vulkan_pipeline_creation_threads=2");
   for (auto& a : ReadSettingsArgs(external_dir + "/" + kSettingsFileName)) {
     ALOGI("setting: %s", a.c_str());
     args.emplace_back(std::move(a));
