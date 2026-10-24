@@ -551,6 +551,24 @@ void Start(const std::string& log_dir) {
 }
 }  // namespace prof
 
+// A fatal startup failure must not be a black screen the user has to guess at.
+// The Android logger is invisible without adb and SDL cannot show a message box
+// here, so drop the reason into logs/crash.txt: SetupActivity pops that file up
+// (copyable) on the next launch. Same file the signal handler writes.
+std::string g_log_dir_for_fatal;
+
+void ReportFatal(const std::string& why) {
+  ALOGE("FATAL: %s", why.c_str());
+  diag::Mark("FATAL: " + why);
+  if (g_log_dir_for_fatal.empty()) return;
+  std::ofstream out(g_log_dir_for_fatal + "/crash.txt", std::ios::trunc);
+  if (!out) return;
+  out << REX_APP_NAME " could not start\n"
+      << why << "\n\n"
+      << "This is not a crash - the app stopped on purpose. Open Logs for the\n"
+      << "startup timeline (logs/startup.txt) and the runtime log.\n";
+}
+
 std::string ResolveLogDir(const std::string& external_dir) {
   const std::string dir = external_dir + "/logs";
   std::error_code ec;
@@ -616,6 +634,7 @@ int RunAndroidApp() {
   std::error_code ec;
   std::filesystem::create_directories(external_dir + "/data", ec);
   const std::string log_dir = ResolveLogDir(external_dir);
+  g_log_dir_for_fatal = log_dir;
   // Start the timeline as early as the directory is known: everything after
   // this point lands in logs/startup.txt, including the stages that never
   // finish when the screen stays black.
@@ -722,13 +741,14 @@ int RunAndroidApp() {
   {
     rex::ui::SDLWindowedAppContext app_context;
     if (!app_context.Initialize()) {
-      REXLOG_ERROR("SDLWindowedAppContext::Initialize failed: {}", SDL_GetError());
+      ReportFatal(fmt::format("SDL window/context initialisation failed: {}", SDL_GetError()));
       return EXIT_FAILURE;
     }
     const auto creator = rex::ui::WindowedApp::GetCreator(kAppIdentifier);
     if (!creator) {
-      REXLOG_ERROR("app '{}' is not registered - recompiled code built for another name",
-                   kAppIdentifier);
+      ReportFatal(fmt::format(
+          "app '{}' is not registered - the recompiled code was built for another name",
+          kAppIdentifier));
       return EXIT_FAILURE;
     }
     diag::Mark("SDL window + app context created");
@@ -742,7 +762,10 @@ int RunAndroidApp() {
       result = app_context.RunMainMessageLoop();
       diag::Mark(fmt::format("message loop exited ({})", result));
     } else {
-      REXLOG_ERROR("OnInitialize failed - see earlier errors");
+      ReportFatal(
+          "the game runtime failed to start (see the log for the failing stage; "
+          "wrong or missing game files and a GPU driver that cannot create a "
+          "Vulkan device are the usual reasons)");
       result = EXIT_FAILURE;
     }
     app->InvokeOnDestroy();
